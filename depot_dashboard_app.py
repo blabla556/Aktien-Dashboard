@@ -145,7 +145,6 @@ def save_user_data(data_dict):
     return True, "ℹ️ Für diese Sitzung gespeichert (Für dauerhaften Cloud-Sync bitte GitHub-Token in Secrets hinterlegen)."
 
 def send_email_alert(subject: str, body_text: str):
-    """Sendet eine E-Mail-Benachrichtigung aufs Smartphone, sofern SMTP-Daten in st.secrets hinterlegt sind."""
     try:
         if "SMTP_USER" in st.secrets and "SMTP_PASSWORD" in st.secrets:
             smtp_server = st.secrets.get("SMTP_SERVER", "smtp.gmail.com")
@@ -266,13 +265,8 @@ def calculate_dividend_cagr(div_series: pd.Series):
     return 3.5
 
 def evaluate_stock_score(pe, p_cf, div_yield, div_cagr, rev_earn_growth, nd_ebitda, upside_1y, is_financial=False, roe=None):
-    """
-    Bewertet die 5 Kern-Kennzahlen mit jeweils 0, 1 oder 2 Punkten (Summe: 0 bis 10 Punkte).
-    Zahlt eine Aktie keine Dividende, wird automatisch das Umsatz-/Gewinnwachstum herangezogen.
-    """
     scores = {}
     
-    # 1. KGV (P/E)
     if pe is not None and pe > 0:
         if pe <= 18:
             scores["KGV"] = 2
@@ -283,7 +277,6 @@ def evaluate_stock_score(pe, p_cf, div_yield, div_cagr, rev_earn_growth, nd_ebit
     else:
         scores["KGV"] = 0
 
-    # 2. Kurs-Cashflow (P/OCF)
     if p_cf is not None and p_cf > 0:
         if p_cf <= 14:
             scores["P/OCF"] = 2
@@ -301,7 +294,6 @@ def evaluate_stock_score(pe, p_cf, div_yield, div_cagr, rev_earn_growth, nd_ebit
     else:
         scores["P/OCF"] = 1
 
-    # 3. Dividendenwachstum ODER Umsatz-/Gewinnwachstum (bei Wachstumswerten ohne Dividende)
     if div_yield is not None and div_yield > 0:
         if div_cagr is not None:
             if div_cagr >= 6.0:
@@ -323,7 +315,6 @@ def evaluate_stock_score(pe, p_cf, div_yield, div_cagr, rev_earn_growth, nd_ebit
         else:
             scores["Wachstum"] = 0
 
-    # 4. Verschuldung (Net Debt / EBITDA) bzw. ROE bei Finanzwerten
     if is_financial:
         if roe is not None:
             if roe >= 12:
@@ -345,7 +336,6 @@ def evaluate_stock_score(pe, p_cf, div_yield, div_cagr, rev_earn_growth, nd_ebit
         else:
             scores["Bilanz (ND/EBITDA)"] = 0
 
-    # 5. Analysten-Kurspotenzial (12M)
     if upside_1y is not None:
         if upside_1y >= 12.0:
             scores["Potenzial (12M)"] = 2
@@ -967,7 +957,7 @@ with tab_compare:
                         "Div.-Rendite": f"{d_yield:.2f} %",
                         "1. KGV (P/E)": f"{pe:.1f}" if pe else "N/A",
                         "2. Kurs-Cashflow (P/OCF)": f"{p_cf:.1f}" if p_cf else (f"ROE: {roe:.1f}%" if roe else "N/A"),
-                        "3. Dynamik (Div. / Ums.-Gew.)": groth_str,
+                        "3. Dynamik (Div. / Ums.-Gew.)": growth_str,
                         "4. Net Debt / EBITDA": "Netto-Cash (<0x)" if (not is_fin and net_debt <= 0) else (f"{nd_ebitda:.2f}x" if nd_ebitda is not None else (f"ROE: {roe:.1f}%" if is_fin and roe else "N/A")),
                         "5. Analysten-Potenzial (12M)": f"{upside_1y:+.1f} %",
                         "🎯 GESAMT-SCORE (0-10)": total_score,
@@ -1053,4 +1043,95 @@ with tab_portfolio:
                 fx = fx_rates.get(disp_curr, 1.0)
                 
                 price_eur = p_adj * fx
-                d_rate
+                d_rate = inf.get("dividendRate", 0) or 0
+                d_yield = (d_rate / p_adj * 100) if (d_rate > 0 and p_adj > 0) else ((inf.get("dividendYield", 0) or 0) * 100)
+                
+                t_mean = (inf.get("targetMeanPrice") or 0) * p_fac
+                upside_1y = ((t_mean / p_adj) - 1.0) * 100 if (t_mean > 0 and p_adj > 0) else 0.0
+                pe = inf.get("trailingPE")
+                
+                rows.append({
+                    "Unternehmen": name,
+                    "WKN": wkn,
+                    "Ticker": t_sym,
+                    "Cluster": cluster,
+                    "Stück": int(shares),
+                    "Kurs (€)": round(price_eur, 2),
+                    "Div.-Rendite (%)": round(d_yield, 2),
+                    "KGV": round(pe, 1) if pe else None,
+                    "Analysten-Potenzial 1J (%)": round(upside_1y, 1)
+                })
+            except Exception:
+                pass
+            progress_bar.progress((idx + 1) / len(valid_items), text=f"Verarbeite {name} ({idx+1}/{len(valid_items)})...")
+            
+        progress_bar.empty()
+        st.session_state["locks_portfolio_df"] = pd.DataFrame(rows)
+
+    if "locks_portfolio_df" in st.session_state and not st.session_state["locks_portfolio_df"].empty:
+        base_df = st.session_state["locks_portfolio_df"].copy()
+        
+        st.markdown("#### ✏️ Stückzahlen anpassen (`+1` / `-1` direkt im Feld `Stück` anklicken oder eintippen)")
+        edited_df = st.data_editor(
+            base_df,
+            column_config={
+                "Stück": st.column_config.NumberColumn(
+                    "Stück (➕/➖)",
+                    help="Klicke in die Zelle und nutze + / - oder tippe die neue Anzahl ein.",
+                    min_value=0,
+                    max_value=100000,
+                    step=1,
+                    format="%d"
+                ),
+                "Unternehmen": st.column_config.TextColumn("Unternehmen", disabled=True),
+                "WKN": st.column_config.TextColumn("WKN", disabled=True),
+                "Ticker": st.column_config.TextColumn("Ticker", disabled=True),
+                "Cluster": st.column_config.TextColumn("Cluster", disabled=True),
+                "Kurs (€)": st.column_config.NumberColumn("Kurs (€)", format="%.2f €", disabled=True),
+                "Div.-Rendite (%)": st.column_config.NumberColumn("Div.-Rendite (%)", format="%.2f %%", disabled=True),
+                "KGV": st.column_config.NumberColumn("KGV", format="%.1f", disabled=True),
+                "Analysten-Potenzial 1J (%)": st.column_config.NumberColumn("Potenzial 1J (%)", format="%+.1f %%", disabled=True),
+            },
+            use_container_width=True,
+            hide_index=True,
+            key="portfolio_editor"
+        )
+        
+        edited_df["Positionswert (€)"] = (edited_df["Stück"] * edited_df["Kurs (€)"]).round(2)
+        edited_df["Jährl. Dividende (€)"] = (edited_df["Positionswert (€)"] * edited_df["Div.-Rendite (%)"] / 100.0).round(2)
+        
+        total_val = edited_df["Positionswert (€)"].sum()
+        total_div = edited_df["Jährl. Dividende (€)"].sum()
+        weighted_yield = (total_div / total_val * 100) if total_val > 0 else 0.0
+        weighted_upside = ((edited_df["Positionswert (€)"] * edited_df["Analysten-Potenzial 1J (%)"]).sum() / total_val) if total_val > 0 else 0.0
+        edited_df["Gewichtung (%)"] = (edited_df["Positionswert (€)"] / total_val * 100).round(2) if total_val > 0 else 0.0
+        
+        if st.button("💾 Geänderte Stückzahlen jetzt dauerhaft speichern", type="primary"):
+            for _, row in edited_df.iterrows():
+                st.session_state["user_data"]["shares"][row["Unternehmen"]] = int(row["Stück"])
+            st.session_state["locks_portfolio_df"] = edited_df[["Unternehmen", "WKN", "Ticker", "Cluster", "Stück", "Kurs (€)", "Div.-Rendite (%)", "KGV", "Analysten-Potenzial 1J (%)"]].copy()
+            ok, msg = save_user_data(st.session_state["user_data"])
+            if ok:
+                st.success(msg)
+            else:
+                st.warning(msg)
+
+        st.markdown("---")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Gesamtwert Depot", f"{total_val:,.2f} €")
+        k2.metric("Jährliche Brutto-Dividende", f"{total_div:,.2f} €")
+        k3.metric("Gewichtete Dividendenrendite", f"{weighted_yield:.2f} %")
+        k4.metric("Ø Analysten-Potenzial (12M)", f"{weighted_upside:+.1f} %")
+        
+        df_sorted = edited_df.sort_values(by="Positionswert (€)", ascending=False)
+        c_chart1, c_chart2 = st.columns(2)
+        with c_chart1:
+            fig_pie = px.pie(df_sorted, values="Positionswert (€)", names="Cluster", hole=0.4, title="Depot-Allokation nach Sektor-Clustern")
+            st.plotly_chart(fig_pie, use_container_width=True)
+        with c_chart2:
+            fig_bar = px.bar(df_sorted.head(15), x="Positionswert (€)", y="Unternehmen", color="Cluster", orientation="h", title="Top-15 Positionen nach Wert (€)")
+            fig_bar.update_layout(yaxis={"categoryorder": "total ascending"})
+            st.plotly_chart(fig_bar, use_container_width=True)
+            
+        st.markdown("#### 📋 Vollständige Bestands- und Potenzialtabelle (inkl. Positionswert & Gewichtung)")
+        st.dataframe(df_sorted, use_container_width=True, hide_index=True)
