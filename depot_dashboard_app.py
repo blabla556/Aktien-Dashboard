@@ -8,6 +8,9 @@ import requests
 import json
 import base64
 import os
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 # --- 1. SEITENKONFIGURATION ---
 st.set_page_config(page_title="Depot & Aktien-Analyse Dashboard", layout="wide", page_icon="📈")
@@ -70,7 +73,7 @@ DEFAULT_WATCHLIST = {
 
 DATA_FILE = "user_data.json"
 
-# --- 3. PERSISTENZ-ENGINE (LOKAL & GITHUB API) ---
+# --- 3. PERSISTENZ-ENGINE (LOKAL & GITHUB API) + E-MAIL ALARME ---
 def load_user_data():
     default_data = {
         "shares": {k: v["shares"] for k, v in DEFAULT_PORTFOLIO.items() if v["ticker"]},
@@ -121,7 +124,9 @@ def save_user_data(data_dict):
             url = f"https://api.github.com/repos/{repo}/contents/{DATA_FILE}"
             headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
             r = requests.get(url, headers=headers, timeout=5)
-            sha = r.json().get("sha") if r.status_code == 200 else None
+            sha = None
+            if r.status_code == 200:
+                sha = r.json().get("sha")
 
             payload = {
                 "message": "Update user_data.json via Streamlit Dashboard",
@@ -138,6 +143,32 @@ def save_user_data(data_dict):
         return False, f"⚠️ Lokal gespeichert (GitHub-Fehler: {e})"
 
     return True, "ℹ️ Für diese Sitzung gespeichert (Für dauerhaften Cloud-Sync bitte GitHub-Token in Secrets hinterlegen)."
+
+def send_email_alert(subject: str, body_text: str):
+    """Sendet eine E-Mail-Benachrichtigung aufs Smartphone, sofern SMTP-Daten in st.secrets hinterlegt sind."""
+    try:
+        if "SMTP_USER" in st.secrets and "SMTP_PASSWORD" in st.secrets:
+            smtp_server = st.secrets.get("SMTP_SERVER", "smtp.gmail.com")
+            smtp_port = int(st.secrets.get("SMTP_PORT", 587))
+            smtp_user = st.secrets["SMTP_USER"]
+            smtp_pass = st.secrets["SMTP_PASSWORD"]
+            email_to = st.secrets.get("EMAIL_RECEIVER", smtp_user)
+
+            msg = MIMEMultipart()
+            msg["From"] = smtp_user
+            msg["To"] = email_to
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body_text, "plain", "utf-8"))
+
+            server = smtplib.SMTP(smtp_server, smtp_port, timeout=10)
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+            server.quit()
+            return True
+    except Exception:
+        pass
+    return False
 
 if "user_data" not in st.session_state:
     st.session_state["user_data"] = load_user_data()
@@ -156,12 +187,14 @@ def get_fx_rates_to_eur():
         eur_usd = yf.Ticker("EURUSD=X").fast_info.get("lastPrice", 1.085)
         eur_gbp = yf.Ticker("EURGBP=X").fast_info.get("lastPrice", 0.84)
         eur_hkd = yf.Ticker("EURHKD=X").fast_info.get("lastPrice", 8.45)
-        if eur_usd > 0: rates["USD"] = 1.0 / eur_usd
-        if eur_gbp > 0:
+        if eur_usd and eur_usd > 0:
+            rates["USD"] = 1.0 / eur_usd
+        if eur_gbp and eur_gbp > 0:
             rates["GBP"] = 1.0 / eur_gbp
             rates["GBp"] = rates["GBP"] / 100.0
             rates["GBX"] = rates["GBP"] / 100.0
-        if eur_hkd > 0: rates["HKD"] = 1.0 / eur_hkd
+        if eur_hkd and eur_hkd > 0:
+            rates["HKD"] = 1.0 / eur_hkd
     except Exception:
         pass
     return rates
@@ -179,13 +212,13 @@ def resolve_identifier_to_ticker(query: str):
         return "PFSE.DE", "PFISTERER Holding SE"
 
     url = f"https://query2.finance.yahoo.com/v1/finance/search?q={query}"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         response = requests.get(url, headers=headers, timeout=5)
         data = response.json()
-        quotes = data.get('quotes', [])
+        quotes = data.get("quotes", [])
         if quotes:
-            return quotes[0]['symbol'], quotes[0].get('longname', quotes[0].get('shortname', query))
+            return quotes[0]["symbol"], quotes[0].get("longname", quotes[0].get("shortname", query))
     except Exception:
         pass
     return q_clean, query
@@ -205,8 +238,8 @@ def calculate_dynamic_cagr(hist_df: pd.DataFrame, target_years: int):
         
     if actual_years < 0.3:
         return None, 0.0
-    start_price = sub_df['Close'].iloc[0]
-    end_price = sub_df['Close'].iloc[-1]
+    start_price = sub_df["Close"].iloc[0]
+    end_price = sub_df["Close"].iloc[-1]
     if start_price <= 0:
         return None, 0.0
     cagr = (end_price / start_price) ** (1 / actual_years) - 1
@@ -216,9 +249,9 @@ def calculate_dividend_cagr(div_series: pd.Series):
     if div_series is None or div_series.empty or len(div_series) < 2:
         return 0.0
     try:
-        div_df = div_series.to_frame(name='div')
-        div_df['year'] = div_df.index.year
-        yearly_divs = div_df.groupby('year')['div'].sum()
+        div_df = div_series.to_frame(name="div")
+        div_df["year"] = div_df.index.year
+        yearly_divs = div_df.groupby("year")["div"].sum()
         current_year = pd.Timestamp.now().year
         full_years = yearly_divs[yearly_divs.index < current_year]
         if len(full_years) >= 2:
@@ -232,48 +265,129 @@ def calculate_dividend_cagr(div_series: pd.Series):
         pass
     return 3.5
 
-def evaluate_stock_score(pe, p_cf, div_cagr, nd_ebitda, upside_1y, is_financial=False, roe=None):
+def evaluate_stock_score(pe, p_cf, div_yield, div_cagr, rev_earn_growth, nd_ebitda, upside_1y, is_financial=False, roe=None):
+    """
+    Bewertet die 5 Kern-Kennzahlen mit jeweils 0, 1 oder 2 Punkten (Summe: 0 bis 10 Punkte).
+    Zahlt eine Aktie keine Dividende, wird automatisch das Umsatz-/Gewinnwachstum herangezogen.
+    """
     scores = {}
+    
+    # 1. KGV (P/E)
     if pe is not None and pe > 0:
-        scores["KGV"] = 2 if pe <= 18 else (1 if pe <= 28 else 0)
+        if pe <= 18:
+            scores["KGV"] = 2
+        elif pe <= 28:
+            scores["KGV"] = 1
+        else:
+            scores["KGV"] = 0
     else:
         scores["KGV"] = 0
 
+    # 2. Kurs-Cashflow (P/OCF)
     if p_cf is not None and p_cf > 0:
-        scores["P/OCF"] = 2 if p_cf <= 14 else (1 if p_cf <= 22 else 0)
+        if p_cf <= 14:
+            scores["P/OCF"] = 2
+        elif p_cf <= 22:
+            scores["P/OCF"] = 1
+        else:
+            scores["P/OCF"] = 0
     elif is_financial and roe is not None:
-        scores["P/OCF"] = 2 if roe >= 12 else (1 if roe >= 8 else 0)
+        if roe >= 12:
+            scores["P/OCF"] = 2
+        elif roe >= 8:
+            scores["P/OCF"] = 1
+        else:
+            scores["P/OCF"] = 0
     else:
         scores["P/OCF"] = 1
 
-    if div_cagr is not None:
-        scores["Div.-Wachstum"] = 2 if div_cagr >= 6.0 else (1 if div_cagr >= 1.0 else 0)
+    # 3. Dividendenwachstum ODER Umsatz-/Gewinnwachstum (bei Wachstumswerten ohne Dividende)
+    if div_yield is not None and div_yield > 0:
+        if div_cagr is not None:
+            if div_cagr >= 6.0:
+                scores["Wachstum"] = 2
+            elif div_cagr >= 1.0:
+                scores["Wachstum"] = 1
+            else:
+                scores["Wachstum"] = 0
+        else:
+            scores["Wachstum"] = 0
     else:
-        scores["Div.-Wachstum"] = 0
+        if rev_earn_growth is not None:
+            if rev_earn_growth >= 12.0:
+                scores["Wachstum"] = 2
+            elif rev_earn_growth >= 4.0:
+                scores["Wachstum"] = 1
+            else:
+                scores["Wachstum"] = 0
+        else:
+            scores["Wachstum"] = 0
 
+    # 4. Verschuldung (Net Debt / EBITDA) bzw. ROE bei Finanzwerten
     if is_financial:
         if roe is not None:
-            scores["Bilanz (ND/EBITDA)"] = 2 if roe >= 12 else (1 if roe >= 7 else 0)
+            if roe >= 12:
+                scores["Bilanz (ND/EBITDA)"] = 2
+            elif roe >= 7:
+                scores["Bilanz (ND/EBITDA)"] = 1
+            else:
+                scores["Bilanz (ND/EBITDA)"] = 0
         else:
             scores["Bilanz (ND/EBITDA)"] = 1
     else:
         if nd_ebitda is not None:
-            scores["Bilanz (ND/EBITDA)"] = 2 if nd_ebitda <= 1.5 else (1 if nd_ebitda <= 3.0 else 0)
+            if nd_ebitda <= 1.5:
+                scores["Bilanz (ND/EBITDA)"] = 2
+            elif nd_ebitda <= 3.0:
+                scores["Bilanz (ND/EBITDA)"] = 1
+            else:
+                scores["Bilanz (ND/EBITDA)"] = 0
         else:
             scores["Bilanz (ND/EBITDA)"] = 0
 
+    # 5. Analysten-Kurspotenzial (12M)
     if upside_1y is not None:
-        scores["Potenzial (12M)"] = 2 if upside_1y >= 12.0 else (1 if upside_1y >= 2.0 else 0)
+        if upside_1y >= 12.0:
+            scores["Potenzial (12M)"] = 2
+        elif upside_1y >= 2.0:
+            scores["Potenzial (12M)"] = 1
+        else:
+            scores["Potenzial (12M)"] = 0
     else:
         scores["Potenzial (12M)"] = 1
 
     total_score = sum(scores.values())
     return total_score, scores
 
+def style_mover_changes(val):
+    if isinstance(val, (int, float)):
+        if val > 0:
+            return "color: #2ecc71; font-weight: bold;"
+        elif val < 0:
+            return "color: #e74c3c; font-weight: bold;"
+    return ""
+
+def style_score_matrix(val):
+    if isinstance(val, (int, float)):
+        if val >= 7:
+            return "background-color: rgba(46, 204, 113, 0.35); font-weight: bold;"
+        elif val >= 4:
+            return "background-color: rgba(241, 196, 15, 0.35); font-weight: bold;"
+        else:
+            return "background-color: rgba(231, 76, 60, 0.35); font-weight: bold;"
+    if isinstance(val, str):
+        if "🟢" in val:
+            return "background-color: rgba(46, 204, 113, 0.15);"
+        elif "🟡" in val:
+            return "background-color: rgba(241, 196, 15, 0.15);"
+        elif "🔴" in val:
+            return "background-color: rgba(231, 76, 60, 0.15);"
+    return ""
+
 # --- 5. SIDEBAR & HAUPTNAVIGATION ---
 st.sidebar.header("🗂️ Mein Depot (46 Werte)")
 portfolio_keys = list(PORTFOLIO.keys())
-display_options = [f"{k} ({v['shares']} Stk. | {v['wkn']})" if v['ticker'] else k for k, v in PORTFOLIO.items()]
+display_options = [f"{k} ({v['shares']} Stk. | {v['wkn']})" if v["ticker"] else k for k, v in PORTFOLIO.items()]
 selected_name = st.sidebar.selectbox(
     "Aktie aus dem Depot wählen:",
     options=display_options,
@@ -284,11 +398,16 @@ selected_key = portfolio_keys[display_options.index(selected_name)]
 selected_meta = PORTFOLIO[selected_key]
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("💾 Cloud-Speicherstatus")
+st.sidebar.subheader("💾 Cloud-Speicher & E-Mail")
 if "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
     st.sidebar.success("GitHub-Sync: Aktiv ✅")
 else:
     st.sidebar.info("GitHub-Sync: Noch nicht in Secrets hinterlegt (Änderungen gelten aktuell pro Sitzung).")
+
+if "SMTP_USER" in st.secrets and "SMTP_PASSWORD" in st.secrets:
+    st.sidebar.success("E-Mail-Alarme: Aktiv 📧")
+else:
+    st.sidebar.caption("E-Mail-Alarme: Optional über SMTP-Daten in Secrets aktivierbar.")
 
 if st.sidebar.button("💾 Alle Änderungen jetzt speichern", use_container_width=True):
     ok, msg = save_user_data(st.session_state["user_data"])
@@ -432,16 +551,17 @@ with tab_start:
             st.error("### 🔔 Ausgelöste Preis-Alarme!")
             for al_msg in triggered_alerts:
                 st.write(al_msg)
+            email_body = "Folgende Preis-Grenzwerte in deinem Aktien-Dashboard wurden erreicht:\n\n" + "\n".join(triggered_alerts)
+            mail_sent = send_email_alert("🔔 Kursalarm: Grenzwert im Aktien-Dashboard erreicht", email_body)
+            if mail_sent:
+                st.info("📧 E-Mail-Benachrichtigung wurde an dein Smartphone versendet!")
         else:
             st.success("✅ Keine Preis-Grenzwerte über- oder unterschritten.")
             
         if mover_rows:
             df_movers = pd.DataFrame(mover_rows).sort_values(by="Heute / 1T (%)", ascending=False)
             st.dataframe(
-                df_movers.style.map(
-                    lambda v: "color: #2ecc71; font-weight: bold;" if isinstance(v, (int, float)) and v > 0 else ("color: #e74c3c; font-weight: bold;" if isinstance(v, (int, float)) and v < 0 else ""),
-                    subset=["Heute / 1T (%)", "Letzte 5T (%)"]
-                ),
+                df_movers.style.map(style_mover_changes, subset=["Heute / 1T (%)", "Letzte 5T (%)"]),
                 use_container_width=True, hide_index=True
             )
 
@@ -483,7 +603,7 @@ with tab_single:
         ).strip()
 
     if search_input:
-        with st.spinner('Marktdaten, Bilanzen und Analystenschätzungen werden ausgewertet...'):
+        with st.spinner("Marktdaten, Bilanzen und Analystenschätzungen werden ausgewertet..."):
             ticker_symbol, resolved_name = resolve_identifier_to_ticker(search_input)
             stock = yf.Ticker(ticker_symbol)
             
@@ -492,22 +612,22 @@ with tab_single:
                 hist = stock.history(period="10y")
                 divs = stock.dividends
                 
-                if hist.empty and 'currentPrice' not in info:
+                if hist.empty and "currentPrice" not in info:
                     st.error(f"Keine validen Daten für '{search_input}' (Ticker: {ticker_symbol}) gefunden.")
                     st.stop()
                     
-                currency = info.get('currency', 'EUR')
-                raw_price = info.get('currentPrice') or info.get('regularMarketPrice') or hist['Close'].iloc[-1]
+                currency = info.get("currency", "EUR")
+                raw_price = info.get("currentPrice") or info.get("regularMarketPrice") or hist["Close"].iloc[-1]
                 
-                is_gbp_pence = (currency in ['GBp', 'GBX'])
+                is_gbp_pence = (currency in ["GBp", "GBX"])
                 price_factor = 0.01 if is_gbp_pence else 1.0
                 current_price = raw_price * price_factor
                 display_currency = "GBP" if is_gbp_pence else currency
                 fx_to_eur = fx_rates.get(display_currency, 1.0)
                 
-                company_name = info.get('longName', resolved_name)
-                sector = info.get('sector', 'Sektor N/A')
-                industry = info.get('industry', '')
+                company_name = info.get("longName", resolved_name)
+                sector = info.get("sector", "Sektor N/A")
+                industry = info.get("industry", "")
                 
                 with col_info:
                     st.subheader(f"{company_name} (`{ticker_symbol}`)")
@@ -520,8 +640,8 @@ with tab_single:
                             matched_shares = v["shares"]
                             break
 
-                div_rate = info.get('dividendRate', 0) or 0
-                div_yield_info = info.get('dividendYield', 0)
+                div_rate = info.get("dividendRate", 0) or 0
+                div_yield_info = info.get("dividendYield", 0)
                 if div_rate > 0 and current_price > 0:
                     div_yield = (div_rate / current_price) * 100
                 elif div_yield_info:
@@ -560,11 +680,11 @@ with tab_single:
 
                 with m2:
                     st.markdown("#### 💰 B: Dividende & Cashflow")
-                    fcf = info.get('freeCashflow')
-                    ocf = info.get('operatingCashflow')
-                    shares_out = info.get('sharesOutstanding')
+                    fcf = info.get("freeCashflow")
+                    ocf = info.get("operatingCashflow")
+                    shares_out = info.get("sharesOutstanding")
                     
-                    is_reit_or_bdc = (sector == 'Real Estate') or ('Asset Management' in industry) or (ticker_symbol in ['O', 'MAIN'])
+                    is_reit_or_bdc = (sector == "Real Estate") or ("Asset Management" in industry) or (ticker_symbol in ["O", "MAIN"])
                     cashflow_basis = ocf if (is_reit_or_bdc and ocf) else fcf
                     cf_label = "OCF/FFO" if is_reit_or_bdc else "FCF"
                     
@@ -591,24 +711,24 @@ with tab_single:
                             else:
                                 st.success(f"🟢 {cf_label}-Payout: {fcf_payout:.1f}% (Gesund)")
                         else:
-                            payout_std = (info.get('payoutRatio', 0) or 0) * 100
+                            payout_std = (info.get("payoutRatio", 0) or 0) * 100
                             st.caption(f"Payout Ratio (Gewinn): {payout_std:.1f}%")
 
                 with m3:
                     st.markdown("#### ⚖️ C: Bewertung (Multiples)")
-                    trailing_pe = info.get('trailingPE')
-                    forward_pe = info.get('forwardPE')
+                    trailing_pe = info.get("trailingPE")
+                    forward_pe = info.get("forwardPE")
                     
-                    eps = info.get('trailingEps')
+                    eps = info.get("trailingEps")
                     hist_5y = hist[hist.index >= (hist.index[-1] - pd.DateOffset(years=5))] if not hist.empty else hist
-                    avg_price_5y = (hist_5y['Close'].mean() * price_factor) if not hist_5y.empty else current_price
+                    avg_price_5y = (hist_5y["Close"].mean() * price_factor) if not hist_5y.empty else current_price
                     pe_5y_avg = (avg_price_5y / eps) if (eps and eps > 0) else None
                     
                     pe_str = f"{trailing_pe:.1f}" if trailing_pe else "N/A"
                     pe_sub = f"Forward KGV: {forward_pe:.1f}" if forward_pe else (f"5J-Schnitt (Proxy): {pe_5y_avg:.1f}" if pe_5y_avg else "Kein positives EPS")
                     st.metric(label="Aktuelles KGV (P/E)", value=pe_str, delta=pe_sub, delta_color="off")
                     
-                    mcap = info.get('marketCap')
+                    mcap = info.get("marketCap")
                     p_cf = (mcap / ocf) if (ocf and ocf > 0 and mcap) else None
                     p_cf_5y = ((avg_price_5y / current_price) * p_cf) if (p_cf and current_price > 0) else None
                     
@@ -618,11 +738,11 @@ with tab_single:
 
                 with m4:
                     st.markdown("#### 🛡️ D: Bilanz & Stabilität")
-                    is_financial = (sector == 'Financial Services') and (ticker_symbol not in ['MAIN', 'DB1.DE'])
+                    is_financial = (sector == "Financial Services") and (ticker_symbol not in ["MAIN", "DB1.DE"])
                     
                     if is_financial:
-                        roe = (info.get('returnOnEquity', 0) or 0) * 100
-                        pb = info.get('priceToBook')
+                        roe = (info.get("returnOnEquity", 0) or 0) * 100
+                        pb = info.get("priceToBook")
                         st.metric(label="Kurs-Buchwert (KBV / P/B)", value=f"{pb:.2f}" if pb else "N/A")
                         if roe > 12:
                             st.success(f"🟢 Eigenkapitalrendite (ROE): {roe:.1f}% (Stark)")
@@ -631,9 +751,9 @@ with tab_single:
                         else:
                             st.error(f"🔴 Eigenkapitalrendite (ROE): {roe:.1f}% (Schwach)")
                     else:
-                        total_debt = info.get('totalDebt', 0) or 0
-                        total_cash = info.get('totalCash', 0) or 0
-                        ebitda = info.get('ebitda')
+                        total_debt = info.get("totalDebt", 0) or 0
+                        total_cash = info.get("totalCash", 0) or 0
+                        ebitda = info.get("ebitda")
                         
                         net_debt = total_debt - total_cash
                         st.metric(label="Nettoverschuldung", value=f"{net_debt / 1e9:.2f} Mrd. {display_currency}")
@@ -654,11 +774,11 @@ with tab_single:
                 st.markdown("---")
                 st.markdown("### 🎯 Perspektivische Entwicklung: Kurs-Szenarien & Dividendenrendite (1, 3 und 5 Jahre)")
                 
-                target_high = (info.get('targetHighPrice') or 0) * price_factor
-                target_mean = (info.get('targetMeanPrice') or 0) * price_factor
-                target_low = (info.get('targetLowPrice') or 0) * price_factor
-                num_analysts = info.get('numberOfAnalystOpinions', 0) or 0
-                rec_key = info.get('recommendationKey', 'none').upper()
+                target_high = (info.get("targetHighPrice") or 0) * price_factor
+                target_mean = (info.get("targetMeanPrice") or 0) * price_factor
+                target_low = (info.get("targetLowPrice") or 0) * price_factor
+                num_analysts = info.get("numberOfAnalystOpinions", 0) or 0
+                rec_key = info.get("recommendationKey", "none").upper()
                 
                 base_cagr_init = ((target_mean / current_price) - 1) * 100 if (target_mean > 0 and current_price > 0) else (cagr_5 if cagr_5 else 7.0)
                 best_cagr_init = ((target_high / current_price) - 1) * 100 if (target_high > 0 and current_price > 0) else base_cagr_init + 6.0
@@ -706,28 +826,28 @@ with tab_single:
 
                     with tab_price:
                         hist_recent = hist[hist.index >= (hist.index[-1] - pd.DateOffset(years=3))].copy()
-                        hist_recent['Close_Adj'] = hist_recent['Close'] * price_factor
+                        hist_recent["Close_Adj"] = hist_recent["Close"] * price_factor
                         
                         fig = go.Figure()
                         fig.add_trace(go.Scatter(
-                            x=hist_recent.index, y=hist_recent['Close_Adj'],
-                            mode='lines', name='Historie (3J)', line=dict(color='#1f77b4', width=2)
+                            x=hist_recent.index, y=hist_recent["Close_Adj"],
+                            mode="lines", name="Historie (3J)", line=dict(color="#1f77b4", width=2)
                         ))
                         fig.add_trace(go.Scatter(
                             x=future_dates, y=best_path,
-                            mode='lines+markers', name=f'Best Case ({best_rate:+.1f}% p.a.)',
-                            line=dict(color='#2ca02c', width=2, dash='dash')
+                            mode="lines+markers", name=f"Best Case ({best_rate:+.1f}% p.a.)",
+                            line=dict(color="#2ca02c", width=2, dash="dash")
                         ))
                         fig.add_trace(go.Scatter(
                             x=future_dates, y=base_path,
-                            mode='lines+markers', name=f'Base Case ({base_rate:+.1f}% p.a.)',
-                            line=dict(color='#ff7f0e', width=3)
+                            mode="lines+markers", name=f"Base Case ({base_rate:+.1f}% p.a.)",
+                            line=dict(color="#ff7f0e", width=3)
                         ))
                         fig.add_trace(go.Scatter(
                             x=future_dates, y=bear_path,
-                            mode='lines+markers', name=f'Bear Case ({bear_rate:+.1f}% p.a.)',
-                            line=dict(color='#d62728', width=2, dash='dot'),
-                            fill='tonexty', fillcolor='rgba(255, 127, 14, 0.1)'
+                            mode="lines+markers", name=f"Bear Case ({bear_rate:+.1f}% p.a.)",
+                            line=dict(color="#d62728", width=2, dash="dot"),
+                            fill="tonexty", fillcolor="rgba(255, 127, 14, 0.1)"
                         ))
                         fig.update_layout(
                             title=f"Kurs-Projektion für {company_name} (in {display_currency})",
@@ -747,8 +867,8 @@ with tab_single:
                                 x=["Aktuell", "In 1 Jahr", "In 3 Jahren", "In 5 Jahren"],
                                 y=[yoc_now, yoc_1y, yoc_3y, yoc_5y],
                                 text=[f"{yoc_now:.2f} %", f"{yoc_1y:.2f} %", f"{yoc_3y:.2f} %", f"{yoc_5y:.2f} %"],
-                                textposition='auto',
-                                marker_color=['#6c757d', '#17a2b8', '#28a745', '#1e7e34']
+                                textposition="auto",
+                                marker_color=["#6c757d", "#17a2b8", "#28a745", "#1e7e34"]
                             )
                         ])
                         fig_div.update_layout(
@@ -765,7 +885,7 @@ with tab_single:
 # ==============================================================================
 with tab_compare:
     st.markdown("### ⚖️ Marktweiter 3-Aktien-Vergleich inkl. Ampel-Bewertungssystem (0 bis 10 Punkte)")
-    st.write("Vergleiche 3 beliebige Aktien (WKN, ISIN oder Ticker) direkt gegeneinander. Die 5 maßgebenden Kennzahlen werden mit je 0 (Rot), 1 (Gelb) oder 2 (Grün) Punkten bewertet.")
+    st.write("Vergleiche 3 beliebige Aktien (WKN, ISIN oder Ticker) direkt gegeneinander. Bei Aktien ohne Dividende fließt automatisch das Umsatz-/Gewinnwachstum in Kriterium 3 ein.")
     
     cc1, cc2, cc3, cc_time = st.columns([1, 1, 1, 1])
     comp_1 = cc1.text_input("Aktie 1 (WKN / Ticker):", value="MSFT")
@@ -809,6 +929,20 @@ with tab_compare:
                     d_yield = (d_rate / p_adj * 100) if (d_rate > 0 and p_adj > 0) else ((inf.get("dividendYield", 0) or 0) * 100)
                     div_cagr = calculate_dividend_cagr(divs_c) if d_yield > 0 else 0.0
                     
+                    rev_g = (inf.get("revenueGrowth") or 0) * 100
+                    earn_g = (inf.get("earningsGrowth") or 0) * 100
+                    if rev_g != 0 and earn_g != 0:
+                        rev_earn_growth = (rev_g + earn_g) / 2.0
+                    elif rev_g != 0:
+                        rev_earn_growth = rev_g
+                    else:
+                        rev_earn_growth = earn_g
+                    
+                    if d_yield > 0:
+                        growth_ str = f"Div: {div_cagr:+.1f} % p.a."
+                    else:
+                        growth_ str = f"Ums/Gew: {rev_earn_growth:+.1f} %"
+                    
                     sector = inf.get("sector", "")
                     is_fin = (sector == "Financial Services") and (t_sym not in ["MAIN", "DB1.DE"])
                     roe = (inf.get("returnOnEquity", 0) or 0) * 100 if is_fin else None
@@ -822,7 +956,9 @@ with tab_compare:
                     t_mean = (inf.get("targetMeanPrice") or 0) * p_fac
                     upside_1y = ((t_mean / p_adj) - 1.0) * 100 if (t_mean > 0 and p_adj > 0) else 0.0
                     
-                    total_score, sub_scores = evaluate_stock_score(pe, p_cf, div_cagr, nd_ebitda, upside_1y, is_fin, roe)
+                    total_score, sub_scores = evaluate_stock_score(
+                        pe, p_cf, d_yield, div_cagr, rev_earn_growth, nd_ebitda, upside_1y, is_fin, roe
+                    )
                     
                     comp_data.append({
                         "Name": inf.get("shortName", r_name),
@@ -831,7 +967,7 @@ with tab_compare:
                         "Div.-Rendite": f"{d_yield:.2f} %",
                         "1. KGV (P/E)": f"{pe:.1f}" if pe else "N/A",
                         "2. Kurs-Cashflow (P/OCF)": f"{p_cf:.1f}" if p_cf else (f"ROE: {roe:.1f}%" if roe else "N/A"),
-                        "3. Div.-Wachstum (5J p.a.)": f"{div_cagr:+.1f} %",
+                        "3. Dynamik (Div. / Ums.-Gew.)": growth_ str,
                         "4. Net Debt / EBITDA": "Netto-Cash (<0x)" if (not is_fin and net_debt <= 0) else (f"{nd_ebitda:.2f}x" if nd_ebitda is not None else (f"ROE: {roe:.1f}%" if is_fin and roe else "N/A")),
                         "5. Analysten-Potenzial (12M)": f"{upside_1y:+.1f} %",
                         "🎯 GESAMT-SCORE (0-10)": total_score,
@@ -877,17 +1013,44 @@ with tab_compare:
                     "🎯 Gesamt-Score (0-10)": item["🎯 GESAMT-SCORE (0-10)"],
                     "1. KGV (P/E)": f"{item['1. KGV (P/E)']}  |  {emo[s_map['KGV']]}",
                     "2. Kurs-Cashflow (P/OCF)": f"{item['2. Kurs-Cashflow (P/OCF)']}  |  {emo[s_map['P/OCF']]}",
-                    "3. Div.-Wachstum (5J)": f"{item['3. Div.-Wachstum (5J p.a.)']}  |  {emo[s_map['Div.-Wachstum']]}",
+                    "3. Wachstum (Div / Ums-Gew)": f"{item['3. Dynamik (Div. / Ums.-Gew.)']}  |  {emo[s_map['Wachstum']]}",
                     "4. Bilanz (ND/EBITDA)": f"{item['4. Net Debt / EBITDA']}  |  {emo[s_map['Bilanz (ND/EBITDA)']]}",
                     "5. Potenzial (12M)": f"{item['5. Analysten-Potenzial (12M)']}  |  {emo[s_map['Potenzial (12M)']]}"
                 })
             df_comp_matrix = pd.DataFrame(matrix_rows)
+            st.dataframe(df_comp_matrix.style.map(style_score_matrix), use_container_width=True, hide_index=True)
+
+# ==============================================================================
+# TAB 4: GESAMTDEPOT-ÜBERSICHT & INTERAKTIVE BESTANDSSTEUERUNG (+1 / -1)
+# ==============================================================================
+with tab_portfolio:
+    st.markdown("### 🗂️ Gesamtdepot-Screening & Interaktive Bestandssteuerung (+1 / -1)")
+    st.write("Klicke auf **Gesamtdepot live auswerten**, um alle 46 Positionen abzurufen. Anschließend kannst du in der Spalte **Stück** per Klick (`+` / `-`) deine Anzahl anpassen und dauerhaft speichern.")
+    
+    if st.button("🔄 Gesamtdepot jetzt live auswerten", type="primary"):
+        rows = []
+        progress_bar = st.progress(0, text="Rufe Livedaten für 46 Aktien ab...")
+        valid_items = [(k, v) for k, v in PORTFOLIO.items() if v["ticker"]]
+        
+        for idx, (name, meta) in enumerate(valid_items):
+            t_sym = meta["ticker"]
+            shares = meta["shares"]
+            wkn = meta["wkn"]
+            cluster = meta["cluster"]
             
-            def color_score_col(val):
-                if isinstance(val, (int, float)):
-                    if val >= 7: return "background-color: rgba(46, 204, 113, 0.35); font-weight: bold;"
-                    elif val >= 4: return "background-color: rgba(241, 196, 15, 0.35); font-weight: bold;"
-                    else: return "background-color: rgba(231, 76, 60, 0.35); font-weight: bold;"
-                if isinstance(val, str):
-                    if "🟢" in val: return "background-color: rgba(46, 204, 113, 0.15);"
-                    if "🟡" in val:
+            if t_sym == "PFS0.DE":
+                t_sym, _ = resolve_identifier_to_ticker("PFSE25")
+                
+            try:
+                tk = yf.Ticker(t_sym)
+                inf = tk.info
+                curr = inf.get("currency", "EUR")
+                raw_p = inf.get("currentPrice") or inf.get("regularMarketPrice") or 0.0
+                
+                p_fac = 0.01 if curr in ["GBp", "GBX"] else 1.0
+                disp_curr = "GBP" if curr in ["GBp", "GBX"] else curr
+                p_adj = raw_p * p_fac
+                fx = fx_rates.get(disp_curr, 1.0)
+                
+                price_eur = p_adj * fx
+                d_rate
