@@ -5,12 +5,15 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 import requests
+import json
+import base64
+import os
 
 # --- 1. SEITENKONFIGURATION ---
 st.set_page_config(page_title="Depot & Aktien-Analyse Dashboard", layout="wide", page_icon="📈")
 
-# --- 2. HINTERLEGTES DEPOT MIT STÜCKZAHLEN (46 POSITIONEN - FINAL BESTÄTIGT) ---
-PORTFOLIO = {
+# --- 2. HINTERLEGTES BASIS-DEPOT (46 POSITIONEN) ---
+DEFAULT_PORTFOLIO = {
     "--- Freie Suche über Eingabefeld nutzen ---": {"ticker": "", "shares": 0, "wkn": "", "cluster": ""},
     "AbbVie Inc.": {"ticker": "ABBV", "shares": 1, "wkn": "A1J84E", "cluster": "Gesundheit / Pharma"},
     "Airbus SE": {"ticker": "AIR.DE", "shares": 3, "wkn": "938914", "cluster": "Industrie & Luftfahrt"},
@@ -60,10 +63,113 @@ PORTFOLIO = {
     "XPeng Inc.": {"ticker": "XPEV", "shares": 39, "wkn": "A2QBX7", "cluster": "Konsum & E-Commerce"}
 }
 
-# --- 3. HILFSFUNKTIONEN (WÄHRUNG, WKN-MAPPING & MATHEMATIK) ---
+DEFAULT_WATCHLIST = {
+    "Quanta Services Inc.": {"ticker": "PWR", "wkn": "911688"},
+    "ASML Holding N.V.": {"ticker": "ASML.AS", "wkn": "A1J4U4"}
+}
+
+DATA_FILE = "user_data.json"
+
+# --- 3. PERSISTENZ-ENGINE (LOKAL & GITHUB API) + TELEGRAM ---
+def load_user_data():
+    """Lädt gespeicherte Stückzahlen, Watchlist und Preis-Alarme aus JSON oder GitHub."""
+    default_data = {
+        "shares": {k: v["shares"] for k, v in DEFAULT_PORTFOLIO.items() if v["ticker"]},
+        "watchlist": DEFAULT_WATCHLIST,
+        "alerts": {}  # Format: {"MSFT": {"min_eur": 350.0, "max_eur": 500.0}}
+    }
+    # 1. Versuch: Direkt von GitHub laden (falls Secrets konfiguriert sind)
+    try:
+        if "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
+            token = st.secrets["GITHUB_TOKEN"]
+            repo = st.secrets["GITHUB_REPO"]
+            url = f"https://api.github.com/repos/{repo}/contents/{DATA_FILE}"
+            headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+            r = requests.get(url, headers=headers, timeout=5)
+            if r.status_code == 200:
+                content = base64.b64decode(r.json()["content"]).decode("utf-8")
+                loaded = json.loads(content)
+                for k in default_data["shares"]:
+                    if k not in loaded.get("shares", {}):
+                        loaded.setdefault("shares", {})[k] = default_data["shares"][k]
+                return loaded
+    except Exception:
+        pass
+
+    # 2. Versuch: Lokale Datei lesen
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                for k in default_data["shares"]:
+                    if k not in loaded.get("shares", {}):
+                        loaded.setdefault("shares", {})[k] = default_data["shares"][k]
+                return loaded
+        except Exception:
+            pass
+    return default_data
+
+def save_user_data(data_dict):
+    """Speichert Daten lokal und (falls konfiguriert) dauerhaft im GitHub-Repository."""
+    json_str = json.dumps(data_dict, indent=2, ensure_ascii=False)
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            f.write(json_str)
+    except Exception:
+        pass
+
+    try:
+        if "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
+            token = st.secrets["GITHUB_TOKEN"]
+            repo = st.secrets["GITHUB_REPO"]
+            url = f"https://api.github.com/repos/{repo}/contents/{DATA_FILE}"
+            headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+            r = requests.get(url, headers=headers, timeout=5)
+            sha = r.json().get("sha") if r.status_code == 200 else None
+
+            payload = {
+                "message": "Update user_data.json via Streamlit Dashboard",
+                "content": base64.b64encode(json_str.encode("utf-8")).decode("utf-8")
+            }
+            if sha:
+                payload["sha"] = sha
+            put_r = requests.put(url, headers=headers, json=payload, timeout=8)
+            if put_r.status_code in [200, 201]:
+                return True, "✅ Dauerhaft in GitHub gespeichert!"
+            else:
+                return False, f"⚠️ Lokal gespeichert, aber GitHub-Fehler ({put_r.status_code})"
+    except Exception as e:
+        return False, f"⚠️ Lokal gespeichert (GitHub-Fehler: {e})"
+
+    return True, "ℹ️ Für diese Sitzung gespeichert (Für dauerhaften Cloud-Sync bitte GitHub-Token in Secrets hinterlegen)."
+
+def send_telegram_alert(message: str):
+    """Sendet eine Benachrichtigung via Telegram Bot, falls in st.secrets hinterlegt."""
+    try:
+        if "TELEGRAM_BOT_TOKEN" in st.secrets and "TELEGRAM_CHAT_ID" in st.secrets:
+            bot_token = st.secrets["TELEGRAM_BOT_TOKEN"]
+            chat_id = st.secrets["TELEGRAM_CHAT_ID"]
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            r = requests.post(url, json={"chat_id": chat_id, "text": message}, timeout=5)
+            return r.status_code == 200
+    except Exception:
+        pass
+    return False
+
+# Initialisiere Session State
+if "user_data" not in st.session_state:
+    st.session_state["user_data"] = load_user_data()
+
+# Dynamisches Portfolio mit gespeicherten Stückzahlen aufbauen
+PORTFOLIO = {}
+for k, v in DEFAULT_PORTFOLIO.items():
+    PORTFOLIO[k] = v.copy()
+    if v["ticker"] and k in st.session_state["user_data"].get("shares", {}):
+        PORTFOLIO[k]["shares"] = int(st.session_state["user_data"]["shares"][k])
+
+# --- 4. HILFSFUNKTIONEN (WÄHRUNG, WKN-MAPPING & MATHEMATIK) ---
 @st.cache_data(ttl=3600)
 def get_fx_rates_to_eur():
-    """Holt aktuelle Wechselkurse zur Umrechnung von USD, GBP und HKD in EUR."""
     rates = {"EUR": 1.0, "USD": 0.92, "GBP": 1.19, "GBp": 0.0119, "GBX": 0.0119, "HKD": 0.118}
     try:
         eur_usd = yf.Ticker("EURUSD=X").fast_info.get("lastPrice", 1.085)
@@ -81,7 +187,6 @@ def get_fx_rates_to_eur():
 
 @st.cache_data(ttl=3600)
 def resolve_identifier_to_ticker(query: str):
-    """Übersetzt WKN, ISIN oder Unternehmensnamen via Yahoo Finance Search API in einen Ticker."""
     q_clean = query.strip().upper()
     if q_clean in ["PFSE25", "PFSE21", "DE000PFSE253", "DE000PFSE212", "PFISTERER", "PFS0.DE", "PFSE.DE"]:
         try:
@@ -105,7 +210,6 @@ def resolve_identifier_to_ticker(query: str):
     return q_clean, query
 
 def calculate_dynamic_cagr(hist_df: pd.DataFrame, target_years: int):
-    """Berechnet die jährliche Kurs-Wachstumsrate (CAGR) mit Fallback auf kürzere Historie."""
     if hist_df.empty or len(hist_df) < 20:
         return None, 0.0
     end_date = hist_df.index[-1]
@@ -128,7 +232,6 @@ def calculate_dynamic_cagr(hist_df: pd.DataFrame, target_years: int):
     return cagr * 100, round(actual_years, 1)
 
 def calculate_dividend_cagr(div_series: pd.Series):
-    """Berechnet das historische Dividendenwachstum (CAGR) der letzten bis zu 5 Jahre."""
     if div_series is None or div_series.empty or len(div_series) < 2:
         return 0.0
     try:
@@ -148,7 +251,54 @@ def calculate_dividend_cagr(div_series: pd.Series):
         pass
     return 3.5
 
-# --- 4. SIDEBAR & HAUPTNAVIGATION ---
+def evaluate_stock_score(pe, p_cf, div_cagr, nd_ebitda, upside_1y, is_financial=False, roe=None):
+    """
+    Bewertet die 5 Kern-Kennzahlen mit jeweils 0, 1 oder 2 Punkten (Summe: 0 bis 10 Punkte)
+    und gibt Einzelfarben sowie Gesamt-Score zurück.
+    """
+    scores = {}
+    # 1. KGV (P/E)
+    if pe is not None and pe > 0:
+        scores["KGV"] = 2 if pe <= 18 else (1 if pe <= 28 else 0)
+    else:
+        scores["KGV"] = 0
+
+    # 2. Kurs-Cashflow (P/OCF)
+    if p_cf is not None and p_cf > 0:
+        scores["P/OCF"] = 2 if p_cf <= 14 else (1 if p_cf <= 22 else 0)
+    elif is_financial and roe is not None:
+        scores["P/OCF"] = 2 if roe >= 12 else (1 if roe >= 8 else 0)
+    else:
+        scores["P/OCF"] = 1
+
+    # 3. Dividendenwachstum / Dynamik (5J CAGR)
+    if div_cagr is not None:
+        scores["Div.-Wachstum"] = 2 if div_cagr >= 6.0 else (1 if div_cagr >= 1.0 else 0)
+    else:
+        scores["Div.-Wachstum"] = 0
+
+    # 4. Verschuldung (Net Debt / EBITDA) bzw. ROE bei Banken
+    if is_financial:
+        if roe is not None:
+            scores["Bilanz (ND/EBITDA)"] = 2 if roe >= 12 else (1 if roe >= 7 else 0)
+        else:
+            scores["Bilanz (ND/EBITDA)"] = 1
+    else:
+        if nd_ebitda is not None:
+            scores["Bilanz (ND/EBITDA)"] = 2 if nd_ebitda <= 1.5 else (1 if nd_ebitda <= 3.0 else 0)
+        else:
+            scores["Bilanz (ND/EBITDA)"] = 0
+
+    # 5. Analysten-Kurspotenzial / Wachstum (12M)
+    if upside_1y is not None:
+        scores["Potenzial (12M)"] = 2 if upside_1y >= 12.0 else (1 if upside_1y >= 2.0 else 0)
+    else:
+        scores["Potenzial (12M)"] = 1
+
+    total_score = sum(scores.values())
+    return total_score, scores
+
+# --- 5. SIDEBAR & HAUPTNAVIGATION ---
 st.sidebar.header("🗂️ Mein Depot (46 Werte)")
 portfolio_keys = list(PORTFOLIO.keys())
 display_options = [f"{k} ({v['shares']} Stk. | {v['wkn']})" if v['ticker'] else k for k, v in PORTFOLIO.items()]
@@ -161,19 +311,203 @@ selected_name = st.sidebar.selectbox(
 selected_key = portfolio_keys[display_options.index(selected_name)]
 selected_meta = PORTFOLIO[selected_key]
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("💾 Cloud-Speicherstatus")
+if "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
+    st.sidebar.success("GitHub-Sync: Aktiv ✅")
+else:
+    st.sidebar.info("GitHub-Sync: Noch nicht in Secrets hinterlegt (Änderungen gelten aktuell pro Sitzung).")
+
+if st.sidebar.button("💾 Alle Änderungen jetzt speichern", use_container_width=True):
+    ok, msg = save_user_data(st.session_state["user_data"])
+    if ok:
+        st.sidebar.success(msg)
+    else:
+        st.sidebar.warning(msg)
+
 st.title("📈 Fundamentales Aktien- & Depot-Dashboard")
 
-main_tab_single, main_tab_portfolio = st.tabs([
-    "🔍 Einzelaktien-Analyse (Historie, Cashflow & 1/3/5J-Szenarien)", 
-    "🗂️ Gesamtdepot-Übersicht (Alle 46 Positionen & Gewichtung)"
+tab_start, tab_single, tab_compare, tab_portfolio = st.tabs([
+    "📰 Start: News, Watchlist & Alarme",
+    "🔍 Einzelaktien-Analyse (1/3/5J-Szenarien)", 
+    "⚖️ 3-Aktien-Vergleich & Ampel-Score (0-10)",
+    "🗂️ Gesamtdepot-Übersicht & Bestand (+1/-1)"
 ])
 
 fx_rates = get_fx_rates_to_eur()
 
 # ==============================================================================
-# TAB 1: EINZELAKTIEN-ANALYSE
+# TAB 1: STARTSEITE (NEWS, WATCHLIST & ALARME)
 # ==============================================================================
-with main_tab_single:
+with tab_start:
+    st.markdown("### 📰 Cockpit: Kurzfrist-Bewegungen, Watchlist, Preis-Alarme & News")
+    
+    col_wl, col_al = st.columns([1.1, 1.3])
+    
+    # --- WATCHLIST VERWALTUNG ---
+    with col_wl:
+        with st.expander("🔭 Watchlist verwalten (Werte hinzufügen / entfernen)", expanded=False):
+            wl_input = st.text_input("Neue Aktie zur Watchlist (WKN, ISIN oder Ticker):", placeholder="z.B. A1J4U4 oder ASML.AS")
+            if st.button("➕ Zur Watchlist hinzufügen"):
+                if wl_input.strip():
+                    t_sym, r_name = resolve_identifier_to_ticker(wl_input.strip())
+                    st.session_state["user_data"].setdefault("watchlist", {})[r_name] = {"ticker": t_sym, "wkn": wl_input.strip().upper()}
+                    save_user_data(st.session_state["user_data"])
+                    st.success(f"{r_name} ({t_sym}) hinzugefügt!")
+                    st.rerun()
+            
+             current_wl = st.session_state["user_data"].get("watchlist", {})
+            if current_wl:
+                del_wl = st.selectbox("Aktie aus Watchlist entfernen:", options=["--- Bitte wählen ---"] + list(current_wl.keys()))
+                if del_wl != "--- Bitte wählen ---" and st.button("🗑️ Aus Watchlist löschen"):
+                    del st.session_state["user_data"]["watchlist"][del_wl]
+                    save_user_data(st.session_state["user_data"])
+                    st.rerun()
+
+    # --- ALARME & GRENZWERTE KONFIGURIEREN ---
+    with col_al:
+        with st.expander("🔔 Preis-Grenzwerte (Alarme in €) festlegen", expanded=False):
+            all_tracked = {k: v["ticker"] for k, v in PORTFOLIO.items() if v["ticker"]}
+            for k, v in st.session_state["user_data"].get("watchlist", {}).items():
+                all_tracked[f"[Watchlist] {k}"] = v["ticker"]
+                
+            sel_alert_name = st.selectbox("Aktie für Grenzwert auswählen:", options=list(all_tracked.keys()))
+            sel_alert_ticker = all_tracked[sel_alert_name]
+            existing_alert = st.session_state["user_data"].get("alerts", {}).get(sel_alert_ticker, {"min_eur": 0.0, "max_eur": 0.0})
+            
+            ca1, ca2 = st.columns(2)
+            min_limit = ca1.number_input("Untergrenze / Kauflimit (€)", min_value=0.0, value=float(existing_alert.get("min_eur", 0.0)), step=1.0)
+            max_limit = ca2.number_input("Obergrenze / Kursziel (€)", min_value=0.0, value=float(existing_alert.get("max_eur", 0.0)), step=1.0)
+            
+            if st.button("💾 Grenzwert speichern"):
+                st.session_state["user_data"].setdefault("alerts", {})[sel_alert_ticker] = {
+                    "name": sel_alert_name,
+                    "min_eur": min_limit,
+                    "max_eur": max_limit
+                }
+                ok, msg = save_user_data(st.session_state["user_data"])
+                st.success(f"Grenzwert für {sel_alert_name} gespeichert! ({msg})")
+
+    st.markdown("---")
+    
+    # --- KURZFRIST-SCANNER (LETZTE TAGE & ALARM-PRÜFUNG) ---
+    col_scan_btn, col_filter = st.columns([1, 2])
+    scan_ group = col_filter.radio("Auswahl für Kurzfrist-Check:", ["⭐ Watchlist & Top-15 Depotwerte (Schnell)", "🗂️ Alle 46 Depotwerte + Watchlist (Komplett)"], horizontal=True)
+    
+    if col_scan_btn.button("🚀 Kurzfrist-Check & Alarme jetzt prüfen", type="primary"):
+        items_to_scan = []
+        for k, v in st.session_state["user_data"].get("watchlist", {}).items():
+            items_to_scan.append(("🔭 Watchlist", k, v["ticker"], v.get("wkn", "")))
+            
+        port_items = [(k, v) for k, v in PORTFOLIO.items() if v["ticker"]]
+        if "Schnell" in scan_group:
+            # Top 15 nach Stückzahl/Relevanz + alle mit gesetztem Alarm
+            alert_tickers = set(st.session_state["user_data"].get("alerts", {}).keys())
+             subset = [x for x in port_items[:15]]
+            for k, v in port_items[15:]:
+                if v["ticker"] in alert_tickers:
+                    subset.append((k, v))
+            port_items = subset
+            
+        for k, v in port_items:
+            items_to_scan.append(("💼 Depot", k, v["ticker"], v["wkn"]))
+            
+        mover_rows = []
+        triggered_alerts = []
+        prog = st.progress(0, text="Prüfe Kurse der letzten Handelstage...")
+        
+        for idx, ( kat, name, t_sym, wkn) in enumerate(items_to_scan):
+            try:
+                tk = yf.Ticker(t_sym)
+                h5 = tk.history(period="7d")
+                if not h5.empty:
+                    curr = tk.fast_info.get("currency", "EUR")
+                    p_fac = 0.01 if curr in ["GBp", "GBX"] else 1.0
+                    disp_c = "GBP" if curr in ["GBp", "GBX"] else curr
+                    fx = fx_rates.get(disp_c, 1.0)
+                    
+                     p_now = h5["Close"].iloc[-1] * p_fac
+                    p_eur = p_now * fx
+                    p_1d = h5["Close"].iloc[-2] * p_fac if len(h5) >= 2 else p_now
+                    p_5d = h5["Close"].iloc[0] * p_fac
+                    
+                    chg_1d = ((p_now / p_1d) - 1) * 100 if p_1d > 0 else 0.0
+                    chg_5d = ((p_now / p_5d) - 1) * 100 if p_5d > 0 else 0.0
+                    
+                    # Alarm-Check
+                    al_ shared = st.session_state["user_data"].get("alerts", {}).get(t_sym, {})
+                    min_e = al_shared.get("min_eur", 0.0)
+                    max_e = al_shared.get("max_eur", 0.0)
+                    status_str = "🟢 OK"
+                    if min_e > 0 and p_eur <= min_e:
+                        status_str = f"🔻 UNTERGRENZE ({min_e:.2f} €)"
+                        triggered_alerts.append(f"⚠️ {name} ({t_sym}): Kurs ({p_eur:.2f} €) hat Untergrenze von {min_e:.2f} € erreicht/unterschritten!")
+                    elif max_e > 0 and p_eur >= max_e:
+                        status_str = f"🚀 OBERGRENZE ({max_e:.2f} €)"
+                        triggered_alerts.append(f"🚀 {name} ({t_sym}): Kurs ({p_eur:.2f} €) hat Obergrenze von {max_e:.2f} € erreicht/überschritten!")
+                        
+                    mover_rows.append({
+                        "Kategorie": kat,
+                        "Unternehmen": name,
+                        "WKN": wkn,
+                        "Ticker": t_sym,
+                        "Kurs (€)": round(p_eur, 2),
+                        "Heute / 1T (%)": round(chg_1d, 2),
+                        "Letzte 5T (%)": round(chg_5d, 2),
+                        "Limit-Status": status_str
+                    })
+            except Exception:
+                pass
+            prog.progress((idx + 1) / len(items_to_scan))
+        prog.empty()
+        
+        if triggered_alerts:
+            st.error("### 🔔 Ausgelöste Preis-Alarme!")
+            for al_msg in triggered_alerts:
+                st.write(al_msg)
+                send_telegram_alert(al_msg)
+        else:
+            st.success("✅ Keine Preis-Grenzwerte über- oder unterschritten.")
+            
+        if mover_rows:
+            df_movers = pd.DataFrame(mover_rows).sort_values(by="Heute / 1T (%)", ascending=False)
+            st.dataframe(
+                df_movers.style.map(
+                    lambda v: "color: #2ecc71; font-weight: bold;" if isinstance(v, (int, float)) and v > 0 else ("color: #e74c3c; font-weight: bold;" if isinstance(v, (int, float)) and v < 0 else ""),
+                    subset=["Heute / 1T (%)", "Letzte 5T (%)"]
+                ),
+                use_container_width=True, hide_index=True
+            )
+
+    st.markdown("---")
+    st.markdown("#### 🗞️ Aktuelle Unternehmens-News (Depot & Watchlist)")
+    news_Pool = {k: v["ticker"] for k, v in st.session_state["user_data"].get("watchlist", {}).items()}
+    for k, v in PORTFOLIO.items():
+        if v["ticker"]:
+            news_Pool[k] = v["ticker"]
+            
+    sel_news_stock = st.selectbox("Wähle eine Aktie für aktuelle Schlagzeilen:", options=list(news_Pool.keys()), index=0)
+    if sel_news_stock:
+        t_news = news_Pool[sel_news_stock]
+        try:
+            raw_news = yf.Ticker(t_news).news
+            if raw_news:
+                for n_item in raw_news[:6]:
+                    # Unterstützung für alte und neue yfinance News-Struktur
+                    content = n_item.get("content", n_item)
+                    title = content.get("title", n_item.get("title", "Schlagzeile"))
+                    publisher = content.get("provider", {}).get("displayName", n_item.get("publisher", "Finanz-News"))
+                    link = content.get("canonicalUrl", {}).get("url", n_item.get("link", f"https://finance.yahoo.com/quote/{t_news}"))
+                    st.markdown(f"- **[{title}]({link})** *(Quelle: {publisher})*")
+            else:
+                st.info("Aktuell keine englisch-/deutschsprachigen Meldungen über den Feed verfügbar.")
+        except Exception:
+            st.caption("News-Feed konnte momentan nicht geladen werden.")
+
+# ==============================================================================
+# TAB 2: EINZELAKTIEN-ANALYSE
+# ==============================================================================
+with tab_single:
     col_search, col_info, col_pos = st.columns([1.1, 1.6, 1.1])
     with col_search:
         default_q = selected_meta["ticker"] if selected_meta["ticker"] else "MSFT"
@@ -214,7 +548,6 @@ with main_tab_single:
                     st.subheader(f"{company_name} (`{ticker_symbol}`)")
                     st.caption(f"**Sektor:** {sector} ({industry}) | **Aktueller Kurs:** `{current_price:.2f} {display_currency}` (~ {current_price * fx_to_eur:.2f} €)")
 
-                # Depot-Bestandsanzeige oben rechts, falls Aktie im Depot
                 matched_shares = selected_meta["shares"] if selected_meta["ticker"] == ticker_symbol else 0
                 if matched_shares == 0:
                     for k, v in PORTFOLIO.items():
@@ -241,10 +574,8 @@ with main_tab_single:
 
                 st.markdown("---")
 
-                # --- 5. DIE 4 FUNDAMENTAL-MODULE ---
                 m1, m2, m3, m4 = st.columns(4)
 
-                # MODUL A: Historische Kursentwicklung (CAGR 5J & 10J)
                 with m1:
                     st.markdown("#### 📊 A: Kurshistorie")
                     cagr_5, yrs_5 = calculate_dynamic_cagr(hist, 5)
@@ -262,7 +593,6 @@ with main_tab_single:
                     else:
                         st.metric(label="Ø Wachstum (10 Jahre)", value="N/A")
 
-                # MODUL B: Dividende, FCF-Ausschüttungsquote & 3/5-Jahres-Erwartung
                 with m2:
                     st.markdown("#### 💰 B: Dividende & Cashflow")
                     fcf = info.get('freeCashflow')
@@ -299,7 +629,6 @@ with main_tab_single:
                             payout_std = (info.get('payoutRatio', 0) or 0) * 100
                             st.caption(f"Payout Ratio (Gewinn): {payout_std:.1f}%")
 
-                # MODUL C: Fundamental-Bewertung (KGV & KCV vs. 5J-Mittel)
                 with m3:
                     st.markdown("#### ⚖️ C: Bewertung (Multiples)")
                     trailing_pe = info.get('trailingPE')
@@ -322,7 +651,6 @@ with main_tab_single:
                     p_cf_sub = f"5J-Schnitt (Proxy): ~{p_cf_5y:.1f}" if p_cf_5y else "Cashflow N/A"
                     st.metric(label="Kurs-Cashflow (P/OCF)", value=p_cf_str, delta=p_cf_sub, delta_color="off")
 
-                # MODUL D: Bilanz & Verschuldung
                 with m4:
                     st.markdown("#### 🛡️ D: Bilanz & Stabilität")
                     is_financial = (sector == 'Financial Services') and (ticker_symbol not in ['MAIN', 'DB1.DE'])
@@ -359,8 +687,6 @@ with main_tab_single:
                             st.warning("🟡 EBITDA negativ/N/A – Bilanz im Detail prüfen")
 
                 st.markdown("---")
-
-                # --- 6. SZENARIO-KORRIDOR (KURS) & DIVIDENDEN-PROJEKTION (3 & 5 JAHRE) ---
                 st.markdown("### 🎯 Perspektivische Entwicklung: Kurs-Szenarien & Dividendenrendite (1, 3 und 5 Jahre)")
                 
                 target_high = (info.get('targetHighPrice') or 0) * price_factor
@@ -399,8 +725,7 @@ with main_tab_single:
                     st.markdown("##### 3. Dividenden-Dynamik")
                     div_growth_rate = st.slider(
                         "Erw. Dividendenwachstum (% p.a.)", 
-                        -10.0, 25.0, round(default_div_growth, 1), 0.5,
-                        help="Vorbelegt mit dem historischen 5-Jahres-Dividendenwachstum (automatisch reduziert bei FCF-Payout > 80%)."
+                        -10.0, 25.0, round(default_div_growth, 1), 0.5
                     )
 
                 with col_charts:
@@ -467,59 +792,153 @@ with main_tab_single:
                         )
                         st.plotly_chart(fig_div, use_container_width=True)
 
-                    yoc_1y_val = div_yield * ((1 + div_growth_rate / 100) ** 1)
-                    yoc_3y_val = div_yield * ((1 + div_growth_rate / 100) ** 3)
-                    yoc_5y_val = div_yield * ((1 + div_growth_rate / 100) ** 5)
-                    
-                    summary_df = pd.DataFrame({
-                        "Kennzahl / Szenario": [
-                            "🚀 Best Case Aktienkurs", 
-                            "🎯 Base Case Aktienkurs (Mittelwert)", 
-                            "🔻 Bear Case Aktienkurs (Untergrenze)",
-                            "💰 Erwartete Dividendenrendite (auf aktuellen Kurs)"
-                        ],
-                        "Dynamik p.a.": [
-                            f"{best_rate:+.1f} %", 
-                            f"{base_rate:+.1f} %", 
-                            f"{bear_rate:+.1f} %",
-                            f"{div_growth_rate:+.1f} %"
-                        ],
-                        "Aktuell": [
-                            f"{current_price:.2f} {display_currency}",
-                            f"{current_price:.2f} {display_currency}",
-                            f"{current_price:.2f} {display_currency}",
-                            f"{div_yield:.2f} %"
-                        ],
-                        "Sicht: 1 Jahr": [
-                            f"{best_path[1]:.2f} {display_currency}", 
-                            f"{base_path[1]:.2f} {display_currency}", 
-                            f"{bear_path[1]:.2f} {display_currency}",
-                            f"{yoc_1y_val:.2f} %"
-                        ],
-                        "Sicht: 3 Jahre": [
-                            f"{best_path[3]:.2f} {display_currency}", 
-                            f"{base_path[3]:.2f} {display_currency}", 
-                            f"{bear_path[3]:.2f} {display_currency}",
-                            f"{yoc_3y_val:.2f} %"
-                        ],
-                        "Sicht: 5 Jahre": [
-                            f"{best_path[5]:.2f} {display_currency}", 
-                            f"{base_path[5]:.2f} {display_currency}", 
-                            f"{bear_path[5]:.2f} {display_currency}",
-                            f"{yoc_5y_val:.2f} %"
-                        ]
-                    })
-                    st.dataframe(summary_df, use_container_width=True, hide_index=True)
-
             except Exception as e:
                 st.error(f"Fehler bei der Verarbeitung der Daten für {ticker_symbol}: {e}")
 
 # ==============================================================================
-# TAB 2: GESAMTDEPOT-ÜBERSICHT (ALLE 46 POSITIONEN)
+# TAB 3: 3-AKTIEN-VERGLEICH & AMPEL-BEWERTUNGSSYSTEM (0 BIS 10 PUNKTE)
 # ==============================================================================
-with main_tab_portfolio:
-    st.markdown("### 🗂️ Gesamtdepot-Screening & Sektor-Allokation (46 Positionen)")
-    st.write("Klicke auf den Button, um alle 46 Depotpositionen live abzurufen, in Euro umzurechnen und nach Kurspotenzial sowie Dividendenrendite auszuwerten.")
+with tab_compare:
+    st.markdown("### ⚖️ Marktweiter 3-Aktien-Vergleich inkl. Ampel-Bewertungssystem (0 bis 10 Punkte)")
+    st.write("Vergleiche 3 beliebige Aktien (WKN, ISIN oder Ticker) direkt gegeneinander. Die 5 maßgebenden Kennzahlen werden mit je 0 (Rot), 1 (Gelb) oder 2 (Grün) Punkten bewertet.")
+    
+    cc1, cc2, cc3, cc_time = st.columns([1, 1, 1, 1])
+    comp_1 = cc1.text_input("Aktie 1 (WKN / Ticker):", value="MSFT")
+    comp_2 = cc2.text_input("Aktie 2 (WKN / Ticker):", value="SAP.DE")
+    comp_3 = cc3.text_input("Aktie 3 (WKN / Ticker):", value="NVDA")
+    comp_period = cc_time.selectbox("Zeitraum für Kursvergleich:", options=["1y", "3y", "5y"], index=1, format_func=lambda x: {"1y": "1 Jahr", "3y": "3 Jahre", "5y": "5 Jahre"}[x])
+
+    if st.button("🔍 3 Aktien jetzt vergleichen & bewerten", type="primary"):
+        queries = [q.strip() for q in [comp_1, comp_2, comp_3] if q.strip()]
+        comp_data = []
+        fig_comp = go.Figure()
+        
+        with st.spinner("Lade Vergleichsdaten und berechne Ampel-Scores..."):
+            for q in queries:
+                t_sym, r_name = resolve_identifier_to_ticker(q)
+                tk = yf.Ticker(t_sym)
+                try:
+                    inf = tk.info
+                    h_c = tk.history(period=comp_period)
+                    divs_c = tk.dividends
+                    
+                    curr = inf.get("currency", "EUR")
+                    p_fac = 0.01 if curr in ["GBp", "GBX"] else 1.0
+                    disp_c = "GBP" if curr in ["GBp", "GBX"] else curr
+                    fx = fx_rates.get(disp_c, 1.0)
+                    
+                    raw_p = inf.get("currentPrice") or inf.get("regularMarketPrice") or (h_c["Close"].iloc[-1] if not h_c.empty else 0)
+                    p_adj = raw_p * p_fac
+                    p_eur = p_adj * fx
+                    
+                    if not h_c.empty and h_c["Close"].iloc[0] > 0:
+                        norm_series = ((h_c["Close"] / h_c["Close"].iloc[0]) - 1.0) * 100
+                        fig_comp.add_trace(go.Scatter(x=h_c.index, y=norm_series, mode="lines", name=f"{inf.get('shortName', r_name)} ({t_sym})"))
+                        
+                    pe = inf.get("trailingPE") or inf.get("forwardPE")
+                    mcap = inf.get("marketCap")
+                    ocf = inf.get("operatingCashflow")
+                    p_cf = (mcap / ocf) if (mcap and ocf and ocf > 0) else None
+                    
+                    d_rate = inf.get("dividendRate", 0) or 0
+                    d_yield = (d_rate / p_adj * 100) if (d_rate > 0 and p_adj > 0) else ((inf.get("dividendYield", 0) or 0) * 100)
+                    div_cagr = calculate_dividend_cagr(divs_c) if d_yield > 0 else 0.0
+                    
+                    sector = inf.get("sector", "")
+                    is_fin = (sector == "Financial Services") and (t_sym not in ["MAIN", "DB1.DE"])
+                    roe = (inf.get("returnOnEquity", 0) or 0) * 100 if is_fin else None
+                    
+                    t_debt = inf.get("totalDebt", 0) or 0
+                    t_cash = inf.get("totalCash", 0) or 0
+                    ebitda = inf.get("ebitda")
+                    net_debt = t_debt - t_cash
+                    nd_ebitda = (net_debt / ebitda) if (ebitda and ebitda > 0) else (0.0 if net_debt <= 0 else None)
+                    
+                    t_mean = (inf.get("targetMeanPrice") or 0) * p_fac
+                    upside_1y = ((t_mean / p_adj) - 1.0) * 100 if (t_mean > 0 and p_adj > 0) else 0.0
+                    
+                    total_score, sub_scores = evaluate_stock_score(pe, p_cf, div_cagr, nd_ebitda, upside_1y, is_fin, roe)
+                    
+                    comp_data.append({
+                        "Name": inf.get("shortName", r_name),
+                        "Ticker": t_sym,
+                        "Kurs (€)": f"{p_eur:.2f} €",
+                        "Div.-Rendite": f"{d_yield:.2f} %",
+                        "1. KGV (P/E)": f"{pe:.1f}" if pe else "N/A",
+                        "2. Kurs-Cashflow (P/OCF)": f"{p_cf:.1f}" if p_cf else (f"ROE: {roe:.1f}%" if roe else "N/A"),
+                        "3. Div.-Wachstum (5J p.a.)": f"{div_cagr:+.1f} %",
+                        "4. Net Debt / EBITDA": "Netto-Cash (<0x)" if (not is_fin and net_debt <= 0) else (f"{nd_ebitda:.2f}x" if nd_ebitda is not None else (f"ROE: {roe:.1f}%" if is_fin and roe else "N/A")),
+                        "5. Analysten-Potenzial (12M)": f"{upside_1y:+.1f} %",
+                        "🎯 GESAMT-SCORE (0-10)": total_score,
+                        "_scores": sub_scores
+                    })
+                except Exception as e:
+                    st.warning(f"Konnte {q} nicht vollständig laden: {e}")
+
+        if comp_data:
+            # Score-Karten mit Farbkodierung (Rot -> Gelb -> Grün)
+            sc_cols = st.columns(len(comp_data))
+            for idx, item in enumerate(comp_data):
+                sc = item["🎯 GESAMT-SCORE (0-10)"]
+                if sc >= 7:
+                    badge = f"🟢 {sc} / 10 Punkte (Stark)"
+                    bg_color = "rgba(46, 204, 113, 0.18)"
+                elif sc >= 4:
+                    badge = f"🟡 {sc} / 10 Punkte (Solide)"
+                    bg_color = "rgba(241, 196, 15, 0.18)"
+                else:
+                    badge = f"🔴 {sc} / 10 Punkte (Schwach/Teuer)"
+                    bg_color = "rgba(231, 76, 60, 0.18)"
+                    
+                with sc_cols[idx]:
+                    st.markdown(
+                        f"<div style='padding:15px; border-radius:10px; background-color:{bg_color}; text-align:center;'>"
+                        f"<h4 style='margin:0;'>{item['Name']} ({item['Ticker']})</h4>"
+                        f"<h2 style='margin:8px 0;'>{badge}</h2>"
+                        f"<small>Aktueller Kurs: {item['Kurs (€)']} | Dividende: {item['Div.-Rendite']}</small>"
+                        f"</div>", unsafe_allow_html=True
+                    )
+            
+            st.markdown("#### 📈 Normierter Kursvergleich (in %)")
+            fig_comp.update_layout(yaxis_title=" Wertentwicklung (%)", xaxis_title="Datum", hovermode="x unified", height=380)
+            st.plotly_chart(fig_comp, use_container_width=True)
+            
+            st.markdown("#### 🚦 Detaillierte Kennzahlen-Matrix mit Ampel-Bewertung")
+            # Tabelle aufbauen inkl. Einzel-Ampeln
+             matrix_rows = []
+            for item in comp_data:
+                s_map = item["_scores"]
+                emo = {2: "🟢 (2 Pkt.)", 1: "🟡 (1 Pkt.)", 0: "🔴 (0 Pkt.)"}
+                matrix_rows.append({
+                    "Unternehmen": f"{item['Name']} ({item['Ticker']})",
+                    "🎯 Gesamt-Score (0-10)": item["🎯 GESAMT-SCORE (0-10)"],
+                    "1. KGV (P/E)": f"{item['1. KGV (P/E)']}  |  {emo[s_map['KGV']]}",
+                    "2. Kurs-Cashflow (P/OCF)": f"{item['2. Kurs-Cashflow (P/OCF)']}  |  {emo[s_map['P/OCF']]}",
+                    "3. Div.-Wachstum (5J)": f"{item['3. Div.-Wachstum (5J p.a.)']}  |  {emo[s_map['Div.-Wachstum']]}",
+                    "4. Bilanz (ND/EBITDA)": f"{item['4. Net Debt / EBITDA']}  |  {emo[s_map['Bilanz (ND/EBITDA)']]}",
+                    "5. Potenzial (12M)": f"{item['5. Analysten-Potenzial (12M)']}  |  {emo[s_map['Potenzial (12M)']]}"
+                })
+            df_comp_matrix = pd.DataFrame(matrix_rows)
+            
+            def color_score_col(val):
+                if isinstance(val, (int, float)):
+                    if val >= 7: return "background-color: rgba(46, 204, 113, 0.35); font-weight: bold;"
+                    elif val >= 4: return "background-color: rgba(241, 196, 15, 0.35); font-weight: bold;"
+                    else: return "background-color: rgba(231, 76, 60, 0.35); font-weight: bold;"
+                if isinstance(val, str):
+                    if "🟢" in val: return "background-color: rgba(46, 204, 113, 0.15);"
+                    if "🟡" in val: return "background-color: rgba(241, 196, 15, 0.15);"
+                    if "🔴" in val: return "background-color: rgba(231, 76, 60, 0.15);"
+                return ""
+
+            st.dataframe(df_comp_matrix.style.map(color_score_col), use_container_width=True, hide_index=True)
+
+# ==============================================================================
+# TAB 4: GESAMTDEPOT-ÜBERSICHT & INTERAKTIVE BESTANDSSTEUERUNG (+1 / -1)
+# ==============================================================================
+with tab_portfolio:
+    st.markdown("### 🗂️ Gesamtdepot-Screening & Interaktive Bestandssteuerung (+1 / -1)")
+    st.write("Klicke auf **Gesamtdepot live auswerten**, um alle 46 Positionen abzurufen. Anschließend kannst du in der Spalte **Stück** per Klick (`+` / `-`) deine Anzahl anpassen und dauerhaft speichern.")
     
     if st.button("🔄 Gesamtdepot jetzt live auswerten", type="primary"):
         rows = []
@@ -547,11 +966,8 @@ with main_tab_portfolio:
                 fx = fx_rates.get(disp_curr, 1.0)
                 
                 price_eur = p_adj * fx
-                pos_val_eur = price_eur * shares
-                
                 d_rate = inf.get("dividendRate", 0) or 0
                 d_yield = (d_rate / p_adj * 100) if (d_rate > 0 and p_adj > 0) else ((inf.get("dividendYield", 0) or 0) * 100)
-                annual_div_eur = pos_val_eur * (d_yield / 100.0)
                 
                 t_mean = (inf.get("targetMeanPrice") or 0) * p_fac
                 upside_1y = ((t_mean / p_adj) - 1.0) * 100 if (t_mean > 0 and p_adj > 0) else 0.0
@@ -562,11 +978,9 @@ with main_tab_portfolio:
                     "WKN": wkn,
                     "Ticker": t_sym,
                     "Cluster": cluster,
-                    "Stück": shares,
+                    "Stück": int(shares),
                     "Kurs (€)": round(price_eur, 2),
-                    "Positionswert (€)": round(pos_val_eur, 2),
                     "Div.-Rendite (%)": round(d_yield, 2),
-                    "Jährl. Dividende (€)": round(annual_div_eur, 2),
                     "KGV": round(pe, 1) if pe else None,
                     "Analysten-Potenzial 1J (%)": round(upside_1y, 1)
                 })
@@ -575,31 +989,73 @@ with main_tab_portfolio:
             progress_bar.progress((idx + 1) / len(valid_items), text=f"Verarbeite {name} ({idx+1}/{len(valid_items)})...")
             
         progress_bar.empty()
+        st.session_state[" locks_portfolio_df"] = pd.DataFrame(rows)
+
+    if " locks_portfolio_df" in st.session_state and not st.session_state[" locks_portfolio_df"].empty:
+        base_df = st.session_state[" locks_portfolio_df"].copy()
         
-        if rows:
-            df_port = pd.DataFrame(rows)
-            total_val = df_port["Positionswert (€)"].sum()
-            total_div = df_port["Jährl. Dividende (€)"].sum()
-            weighted_yield = (total_div / total_val * 100) if total_val > 0 else 0.0
-            weighted_upside = ((df_port["Positionswert (€)"] * df_port["Analysten-Potenzial 1J (%)"]).sum() / total_val) if total_val > 0 else 0.0
+        st.markdown("#### ✏️ Stückzahlen anpassen (`+1` / `-1` direkt im Feld `Stück` anklicken oder eintippen)")
+        edited_df = st.data_editor(
+            base_df,
+            column_config={
+                "Stück": st.column_config.NumberColumn(
+                    "Stück (➕/➖)",
+                    help="Klicke in die Zelle und nutze + / - oder tippe die neue Anzahl ein.",
+                    min_value=0,
+                    max_value=100000,
+                    step=1,
+                    format="%d"
+                ),
+                "Unternehmen": st.column_config.TextColumn("Unternehmen", disabled=True),
+                "WKN": st.column_config.TextColumn("WKN", disabled=True),
+                "Ticker": st.column_config.TextColumn("Ticker", disabled=True),
+                "Cluster": st.column_config.TextColumn("Cluster", disabled=True),
+                "Kurs (€)": st.column_config.NumberColumn("Kurs (€)", format="%.2f €", disabled=True),
+                "Div.-Rendite (%)": st.column_config.NumberColumn("Div.-Rendite (%)", format="%.2f %%", disabled=True),
+                "KGV": st.column_config.NumberColumn("KGV", format="%.1f", disabled=True),
+                "Analysten-Potenzial 1J (%)": st.column_config.NumberColumn("Potenzial 1J (%)", format="%+.1f %%", disabled=True),
+            },
+            use_container_width=True,
+            hide_index=True,
+            key="portfolio_editor"
+        )
+        
+        # Dynamische Neuberechnung anhand der editierten Stückzahlen
+        edited_df["Positionswert (€)"] = (edited_df["Stück"] * edited_df["Kurs (€)"]).round(2)
+        edited_df["Jährl. Dividende (€)"] = (edited_df["Positionswert (€)"] * edited_df["Div.-Rendite (%)"] / 100.0).round(2)
+        
+        total_val = edited_df["Positionswert (€)"].sum()
+        total_div = edited_df["Jährl. Dividende (€)"].sum()
+        weighted_yield = (total_div / total_val * 100) if total_val > 0 else 0.0
+        weighted_upside = ((edited_df["Positionswert (€)"] * edited_df["Analysten-Potenzial 1J (%)"]).sum() / total_val) if total_val > 0 else 0.0
+        edited_df["Gewichtung (%)"] = (edited_df["Positionswert (€)"] / total_val * 100).round(2) if total_val > 0 else 0.0
+        
+        if st.button("💾 Geänderte Stückzahlen jetzt dauerhaft speichern", type="primary"):
+            for _, row in edited_df.iterrows():
+                st.session_state["user_data"]["shares"][row["Unternehmen"]] = int(row["Stück"])
+            st.session_state[" locks_portfolio_df"] = edited_df[["Unternehmen", "WKN", "Ticker", "Cluster", "Stück", "Kurs (€)", "Div.-Rendite (%)", "KGV", "Analysten-Potenzial 1J (%)"]].copy()
+            ok, msg = save_user_data(st.session_state["user_data"])
+            if ok:
+                st.success(msg)
+            else:
+                st.warning(msg)
+
+        st.markdown("---")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Gesamtwert Depot", f"{total_val:,.2f} €")
+        k2.metric("Jährliche Brutto-Dividende", f"{total_div:,.2f} €")
+        k3.metric("Gewichtete Dividendenrendite", f"{weighted_yield:.2f} %")
+        k4.metric("Ø Analysten-Potenzial (12M)", f"{weighted_upside:+.1f} %")
+        
+        df_sorted = edited_df.sort_values(by="Positionswert (€)", ascending=False)
+        c_chart1, c_chart2 = st.columns(2)
+        with c_chart1:
+            fig_pie = px.pie(df_sorted, values="Positionswert (€)", names="Cluster", hole=0.4, title="Depot-Allokation nach Sektor-Clustern")
+            st.plotly_chart(fig_pie, use_container_width=True)
+        with c_chart2:
+            fig_bar = px.bar(df_sorted.head(15), x="Positionswert (€)", y="Unternehmen", color="Cluster", orientation="h", title="Top-15 Positionen nach Wert (€)")
+            fig_bar.update_layout(yaxis={'categoryorder':'total ascending'})
+            st.plotly_chart(fig_bar, use_container_width=True)
             
-            df_port["Gewichtung (%)"] = (df_port["Positionswert (€)"] / total_val * 100).round(2)
-            df_port = df_port.sort_values(by="Positionswert (€)", ascending=False)
-            
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Gesamtwert Depot", f"{total_val:,.2f} €")
-            k2.metric("Jährliche Brutto-Dividende", f"{total_div:,.2f} €")
-            k3.metric("Gewichtete Dividendenrendite", f"{weighted_yield:.2f} %")
-            k4.metric("Ø Analysten-Potenzial (12M)", f"{weighted_upside:+.1f} %")
-            
-            c_chart1, c_chart2 = st.columns(2)
-            with c_chart1:
-                fig_pie = px.pie(df_port, values="Positionswert (€)", names="Cluster", hole=0.4, title="Depot-Allokation nach Sektor-Clustern")
-                st.plotly_chart(fig_pie, use_container_width=True)
-            with c_chart2:
-                fig_bar = px.bar(df_port.head(15), x="Positionswert (€)", y="Unternehmen", color="Cluster", orientation="h", title="Top-15 Positionen nach Wert (€)")
-                fig_bar.update_layout(yaxis={'categoryorder':'total ascending'})
-                st.plotly_chart(fig_bar, use_container_width=True)
-                
-            st.markdown("#### 📋 Vollständige Bestands- und Potenzialtabelle (sortierbar)")
-            st.dataframe(df_port, use_container_width=True, hide_index=True)
+        st.markdown("#### 📋 Vollständige Bestands- und Potenzialtabelle (inkl. Positionswert & Gewichtung)")
+        st.dataframe(df_sorted, use_container_width=True, hide_index=True)
