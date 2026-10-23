@@ -939,9 +939,9 @@ with tab_compare:
                         rev_earn_growth = earn_g
                     
                     if d_yield > 0:
-                        growth_ str = f"Div: {div_cagr:+.1f} % p.a."
+                        growth_str = f"Div: {div_cagr:+.1f} % p.a."
                     else:
-                        growth_ str = f"Ums/Gew: {rev_earn_growth:+.1f} %"
+                        growth_str = f"Ums/Gew: {rev_earn_growth:+.1f} %"
                     
                     sector = inf.get("sector", "")
                     is_fin = (sector == "Financial Services") and (t_sym not in ["MAIN", "DB1.DE"])
