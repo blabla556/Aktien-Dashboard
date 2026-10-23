@@ -70,15 +70,13 @@ DEFAULT_WATCHLIST = {
 
 DATA_FILE = "user_data.json"
 
-# --- 3. PERSISTENZ-ENGINE (LOKAL & GITHUB API) + TELEGRAM ---
+# --- 3. PERSISTENZ-ENGINE (LOKAL & GITHUB API) ---
 def load_user_data():
-    """Lädt gespeicherte Stückzahlen, Watchlist und Preis-Alarme aus JSON oder GitHub."""
     default_data = {
         "shares": {k: v["shares"] for k, v in DEFAULT_PORTFOLIO.items() if v["ticker"]},
         "watchlist": DEFAULT_WATCHLIST,
-        "alerts": {}  # Format: {"MSFT": {"min_eur": 350.0, "max_eur": 500.0}}
+        "alerts": {}
     }
-    # 1. Versuch: Direkt von GitHub laden (falls Secrets konfiguriert sind)
     try:
         if "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
             token = st.secrets["GITHUB_TOKEN"]
@@ -96,7 +94,6 @@ def load_user_data():
     except Exception:
         pass
 
-    # 2. Versuch: Lokale Datei lesen
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -110,7 +107,6 @@ def load_user_data():
     return default_data
 
 def save_user_data(data_dict):
-    """Speichert Daten lokal und (falls konfiguriert) dauerhaft im GitHub-Repository."""
     json_str = json.dumps(data_dict, indent=2, ensure_ascii=False)
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -143,24 +139,9 @@ def save_user_data(data_dict):
 
     return True, "ℹ️ Für diese Sitzung gespeichert (Für dauerhaften Cloud-Sync bitte GitHub-Token in Secrets hinterlegen)."
 
-def send_telegram_alert(message: str):
-    """Sendet eine Benachrichtigung via Telegram Bot, falls in st.secrets hinterlegt."""
-    try:
-        if "TELEGRAM_BOT_TOKEN" in st.secrets and "TELEGRAM_CHAT_ID" in st.secrets:
-            bot_token = st.secrets["TELEGRAM_BOT_TOKEN"]
-            chat_id = st.secrets["TELEGRAM_CHAT_ID"]
-            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-            r = requests.post(url, json={"chat_id": chat_id, "text": message}, timeout=5)
-            return r.status_code == 200
-    except Exception:
-        pass
-    return False
-
-# Initialisiere Session State
 if "user_data" not in st.session_state:
     st.session_state["user_data"] = load_user_data()
 
-# Dynamisches Portfolio mit gespeicherten Stückzahlen aufbauen
 PORTFOLIO = {}
 for k, v in DEFAULT_PORTFOLIO.items():
     PORTFOLIO[k] = v.copy()
@@ -252,18 +233,12 @@ def calculate_dividend_cagr(div_series: pd.Series):
     return 3.5
 
 def evaluate_stock_score(pe, p_cf, div_cagr, nd_ebitda, upside_1y, is_financial=False, roe=None):
-    """
-    Bewertet die 5 Kern-Kennzahlen mit jeweils 0, 1 oder 2 Punkten (Summe: 0 bis 10 Punkte)
-    und gibt Einzelfarben sowie Gesamt-Score zurück.
-    """
     scores = {}
-    # 1. KGV (P/E)
     if pe is not None and pe > 0:
         scores["KGV"] = 2 if pe <= 18 else (1 if pe <= 28 else 0)
     else:
         scores["KGV"] = 0
 
-    # 2. Kurs-Cashflow (P/OCF)
     if p_cf is not None and p_cf > 0:
         scores["P/OCF"] = 2 if p_cf <= 14 else (1 if p_cf <= 22 else 0)
     elif is_financial and roe is not None:
@@ -271,13 +246,11 @@ def evaluate_stock_score(pe, p_cf, div_cagr, nd_ebitda, upside_1y, is_financial=
     else:
         scores["P/OCF"] = 1
 
-    # 3. Dividendenwachstum / Dynamik (5J CAGR)
     if div_cagr is not None:
         scores["Div.-Wachstum"] = 2 if div_cagr >= 6.0 else (1 if div_cagr >= 1.0 else 0)
     else:
         scores["Div.-Wachstum"] = 0
 
-    # 4. Verschuldung (Net Debt / EBITDA) bzw. ROE bei Banken
     if is_financial:
         if roe is not None:
             scores["Bilanz (ND/EBITDA)"] = 2 if roe >= 12 else (1 if roe >= 7 else 0)
@@ -289,7 +262,6 @@ def evaluate_stock_score(pe, p_cf, div_cagr, nd_ebitda, upside_1y, is_financial=
         else:
             scores["Bilanz (ND/EBITDA)"] = 0
 
-    # 5. Analysten-Kurspotenzial / Wachstum (12M)
     if upside_1y is not None:
         scores["Potenzial (12M)"] = 2 if upside_1y >= 12.0 else (1 if upside_1y >= 2.0 else 0)
     else:
@@ -305,7 +277,7 @@ display_options = [f"{k} ({v['shares']} Stk. | {v['wkn']})" if v['ticker'] else 
 selected_name = st.sidebar.selectbox(
     "Aktie aus dem Depot wählen:",
     options=display_options,
-    index=29  # Startwert: Microsoft Corp.
+    index=29
 )
 
 selected_key = portfolio_keys[display_options.index(selected_name)]
@@ -344,7 +316,6 @@ with tab_start:
     
     col_wl, col_al = st.columns([1.1, 1.3])
     
-    # --- WATCHLIST VERWALTUNG ---
     with col_wl:
         with st.expander("🔭 Watchlist verwalten (Werte hinzufügen / entfernen)", expanded=False):
             wl_input = st.text_input("Neue Aktie zur Watchlist (WKN, ISIN oder Ticker):", placeholder="z.B. A1J4U4 oder ASML.AS")
@@ -356,7 +327,7 @@ with tab_start:
                     st.success(f"{r_name} ({t_sym}) hinzugefügt!")
                     st.rerun()
             
-             current_wl = st.session_state["user_data"].get("watchlist", {})
+            current_wl = st.session_state["user_data"].get("watchlist", {})
             if current_wl:
                 del_wl = st.selectbox("Aktie aus Watchlist entfernen:", options=["--- Bitte wählen ---"] + list(current_wl.keys()))
                 if del_wl != "--- Bitte wählen ---" and st.button("🗑️ Aus Watchlist löschen"):
@@ -364,7 +335,6 @@ with tab_start:
                     save_user_data(st.session_state["user_data"])
                     st.rerun()
 
-    # --- ALARME & GRENZWERTE KONFIGURIEREN ---
     with col_al:
         with st.expander("🔔 Preis-Grenzwerte (Alarme in €) festlegen", expanded=False):
             all_tracked = {k: v["ticker"] for k, v in PORTFOLIO.items() if v["ticker"]}
@@ -390,9 +360,8 @@ with tab_start:
 
     st.markdown("---")
     
-    # --- KURZFRIST-SCANNER (LETZTE TAGE & ALARM-PRÜFUNG) ---
     col_scan_btn, col_filter = st.columns([1, 2])
-    scan_ group = col_filter.radio("Auswahl für Kurzfrist-Check:", ["⭐ Watchlist & Top-15 Depotwerte (Schnell)", "🗂️ Alle 46 Depotwerte + Watchlist (Komplett)"], horizontal=True)
+    scan_group = col_filter.radio("Auswahl für Kurzfrist-Check:", ["⭐ Watchlist & Top-15 Depotwerte (Schnell)", "🗂️ Alle 46 Depotwerte + Watchlist (Komplett)"], horizontal=True)
     
     if col_scan_btn.button("🚀 Kurzfrist-Check & Alarme jetzt prüfen", type="primary"):
         items_to_scan = []
@@ -401,9 +370,8 @@ with tab_start:
             
         port_items = [(k, v) for k, v in PORTFOLIO.items() if v["ticker"]]
         if "Schnell" in scan_group:
-            # Top 15 nach Stückzahl/Relevanz + alle mit gesetztem Alarm
             alert_tickers = set(st.session_state["user_data"].get("alerts", {}).keys())
-             subset = [x for x in port_items[:15]]
+            subset = [x for x in port_items[:15]]
             for k, v in port_items[15:]:
                 if v["ticker"] in alert_tickers:
                     subset.append((k, v))
@@ -416,7 +384,7 @@ with tab_start:
         triggered_alerts = []
         prog = st.progress(0, text="Prüfe Kurse der letzten Handelstage...")
         
-        for idx, ( kat, name, t_sym, wkn) in enumerate(items_to_scan):
+        for idx, (kat, name, t_sym, wkn) in enumerate(items_to_scan):
             try:
                 tk = yf.Ticker(t_sym)
                 h5 = tk.history(period="7d")
@@ -426,7 +394,7 @@ with tab_start:
                     disp_c = "GBP" if curr in ["GBp", "GBX"] else curr
                     fx = fx_rates.get(disp_c, 1.0)
                     
-                     p_now = h5["Close"].iloc[-1] * p_fac
+                    p_now = h5["Close"].iloc[-1] * p_fac
                     p_eur = p_now * fx
                     p_1d = h5["Close"].iloc[-2] * p_fac if len(h5) >= 2 else p_now
                     p_5d = h5["Close"].iloc[0] * p_fac
@@ -434,8 +402,7 @@ with tab_start:
                     chg_1d = ((p_now / p_1d) - 1) * 100 if p_1d > 0 else 0.0
                     chg_5d = ((p_now / p_5d) - 1) * 100 if p_5d > 0 else 0.0
                     
-                    # Alarm-Check
-                    al_ shared = st.session_state["user_data"].get("alerts", {}).get(t_sym, {})
+                    al_shared = st.session_state["user_data"].get("alerts", {}).get(t_sym, {})
                     min_e = al_shared.get("min_eur", 0.0)
                     max_e = al_shared.get("max_eur", 0.0)
                     status_str = "🟢 OK"
@@ -465,7 +432,6 @@ with tab_start:
             st.error("### 🔔 Ausgelöste Preis-Alarme!")
             for al_msg in triggered_alerts:
                 st.write(al_msg)
-                send_telegram_alert(al_msg)
         else:
             st.success("✅ Keine Preis-Grenzwerte über- oder unterschritten.")
             
@@ -493,7 +459,6 @@ with tab_start:
             raw_news = yf.Ticker(t_news).news
             if raw_news:
                 for n_item in raw_news[:6]:
-                    # Unterstützung für alte und neue yfinance News-Struktur
                     content = n_item.get("content", n_item)
                     title = content.get("title", n_item.get("title", "Schlagzeile"))
                     publisher = content.get("provider", {}).get("displayName", n_item.get("publisher", "Finanz-News"))
@@ -876,7 +841,6 @@ with tab_compare:
                     st.warning(f"Konnte {q} nicht vollständig laden: {e}")
 
         if comp_data:
-            # Score-Karten mit Farbkodierung (Rot -> Gelb -> Grün)
             sc_cols = st.columns(len(comp_data))
             for idx, item in enumerate(comp_data):
                 sc = item["🎯 GESAMT-SCORE (0-10)"]
@@ -900,12 +864,11 @@ with tab_compare:
                     )
             
             st.markdown("#### 📈 Normierter Kursvergleich (in %)")
-            fig_comp.update_layout(yaxis_title=" Wertentwicklung (%)", xaxis_title="Datum", hovermode="x unified", height=380)
+            fig_comp.update_layout(yaxis_title="Wertentwicklung (%)", xaxis_title="Datum", hovermode="x unified", height=380)
             st.plotly_chart(fig_comp, use_container_width=True)
             
             st.markdown("#### 🚦 Detaillierte Kennzahlen-Matrix mit Ampel-Bewertung")
-            # Tabelle aufbauen inkl. Einzel-Ampeln
-             matrix_rows = []
+            matrix_rows = []
             for item in comp_data:
                 s_map = item["_scores"]
                 emo = {2: "🟢 (2 Pkt.)", 1: "🟡 (1 Pkt.)", 0: "🔴 (0 Pkt.)"}
@@ -927,135 +890,4 @@ with tab_compare:
                     else: return "background-color: rgba(231, 76, 60, 0.35); font-weight: bold;"
                 if isinstance(val, str):
                     if "🟢" in val: return "background-color: rgba(46, 204, 113, 0.15);"
-                    if "🟡" in val: return "background-color: rgba(241, 196, 15, 0.15);"
-                    if "🔴" in val: return "background-color: rgba(231, 76, 60, 0.15);"
-                return ""
-
-            st.dataframe(df_comp_matrix.style.map(color_score_col), use_container_width=True, hide_index=True)
-
-# ==============================================================================
-# TAB 4: GESAMTDEPOT-ÜBERSICHT & INTERAKTIVE BESTANDSSTEUERUNG (+1 / -1)
-# ==============================================================================
-with tab_portfolio:
-    st.markdown("### 🗂️ Gesamtdepot-Screening & Interaktive Bestandssteuerung (+1 / -1)")
-    st.write("Klicke auf **Gesamtdepot live auswerten**, um alle 46 Positionen abzurufen. Anschließend kannst du in der Spalte **Stück** per Klick (`+` / `-`) deine Anzahl anpassen und dauerhaft speichern.")
-    
-    if st.button("🔄 Gesamtdepot jetzt live auswerten", type="primary"):
-        rows = []
-        progress_bar = st.progress(0, text="Rufe Livedaten für 46 Aktien ab...")
-        valid_items = [(k, v) for k, v in PORTFOLIO.items() if v["ticker"]]
-        
-        for idx, (name, meta) in enumerate(valid_items):
-            t_sym = meta["ticker"]
-            shares = meta["shares"]
-            wkn = meta["wkn"]
-            cluster = meta["cluster"]
-            
-            if t_sym == "PFS0.DE":
-                t_sym, _ = resolve_identifier_to_ticker("PFSE25")
-                
-            try:
-                tk = yf.Ticker(t_sym)
-                inf = tk.info
-                curr = inf.get("currency", "EUR")
-                raw_p = inf.get("currentPrice") or inf.get("regularMarketPrice") or 0.0
-                
-                p_fac = 0.01 if curr in ["GBp", "GBX"] else 1.0
-                disp_curr = "GBP" if curr in ["GBp", "GBX"] else curr
-                p_adj = raw_p * p_fac
-                fx = fx_rates.get(disp_curr, 1.0)
-                
-                price_eur = p_adj * fx
-                d_rate = inf.get("dividendRate", 0) or 0
-                d_yield = (d_rate / p_adj * 100) if (d_rate > 0 and p_adj > 0) else ((inf.get("dividendYield", 0) or 0) * 100)
-                
-                t_mean = (inf.get("targetMeanPrice") or 0) * p_fac
-                upside_1y = ((t_mean / p_adj) - 1.0) * 100 if (t_mean > 0 and p_adj > 0) else 0.0
-                pe = inf.get("trailingPE")
-                
-                rows.append({
-                    "Unternehmen": name,
-                    "WKN": wkn,
-                    "Ticker": t_sym,
-                    "Cluster": cluster,
-                    "Stück": int(shares),
-                    "Kurs (€)": round(price_eur, 2),
-                    "Div.-Rendite (%)": round(d_yield, 2),
-                    "KGV": round(pe, 1) if pe else None,
-                    "Analysten-Potenzial 1J (%)": round(upside_1y, 1)
-                })
-            except Exception:
-                pass
-            progress_bar.progress((idx + 1) / len(valid_items), text=f"Verarbeite {name} ({idx+1}/{len(valid_items)})...")
-            
-        progress_bar.empty()
-        st.session_state[" locks_portfolio_df"] = pd.DataFrame(rows)
-
-    if " locks_portfolio_df" in st.session_state and not st.session_state[" locks_portfolio_df"].empty:
-        base_df = st.session_state[" locks_portfolio_df"].copy()
-        
-        st.markdown("#### ✏️ Stückzahlen anpassen (`+1` / `-1` direkt im Feld `Stück` anklicken oder eintippen)")
-        edited_df = st.data_editor(
-            base_df,
-            column_config={
-                "Stück": st.column_config.NumberColumn(
-                    "Stück (➕/➖)",
-                    help="Klicke in die Zelle und nutze + / - oder tippe die neue Anzahl ein.",
-                    min_value=0,
-                    max_value=100000,
-                    step=1,
-                    format="%d"
-                ),
-                "Unternehmen": st.column_config.TextColumn("Unternehmen", disabled=True),
-                "WKN": st.column_config.TextColumn("WKN", disabled=True),
-                "Ticker": st.column_config.TextColumn("Ticker", disabled=True),
-                "Cluster": st.column_config.TextColumn("Cluster", disabled=True),
-                "Kurs (€)": st.column_config.NumberColumn("Kurs (€)", format="%.2f €", disabled=True),
-                "Div.-Rendite (%)": st.column_config.NumberColumn("Div.-Rendite (%)", format="%.2f %%", disabled=True),
-                "KGV": st.column_config.NumberColumn("KGV", format="%.1f", disabled=True),
-                "Analysten-Potenzial 1J (%)": st.column_config.NumberColumn("Potenzial 1J (%)", format="%+.1f %%", disabled=True),
-            },
-            use_container_width=True,
-            hide_index=True,
-            key="portfolio_editor"
-        )
-        
-        # Dynamische Neuberechnung anhand der editierten Stückzahlen
-        edited_df["Positionswert (€)"] = (edited_df["Stück"] * edited_df["Kurs (€)"]).round(2)
-        edited_df["Jährl. Dividende (€)"] = (edited_df["Positionswert (€)"] * edited_df["Div.-Rendite (%)"] / 100.0).round(2)
-        
-        total_val = edited_df["Positionswert (€)"].sum()
-        total_div = edited_df["Jährl. Dividende (€)"].sum()
-        weighted_yield = (total_div / total_val * 100) if total_val > 0 else 0.0
-        weighted_upside = ((edited_df["Positionswert (€)"] * edited_df["Analysten-Potenzial 1J (%)"]).sum() / total_val) if total_val > 0 else 0.0
-        edited_df["Gewichtung (%)"] = (edited_df["Positionswert (€)"] / total_val * 100).round(2) if total_val > 0 else 0.0
-        
-        if st.button("💾 Geänderte Stückzahlen jetzt dauerhaft speichern", type="primary"):
-            for _, row in edited_df.iterrows():
-                st.session_state["user_data"]["shares"][row["Unternehmen"]] = int(row["Stück"])
-            st.session_state[" locks_portfolio_df"] = edited_df[["Unternehmen", "WKN", "Ticker", "Cluster", "Stück", "Kurs (€)", "Div.-Rendite (%)", "KGV", "Analysten-Potenzial 1J (%)"]].copy()
-            ok, msg = save_user_data(st.session_state["user_data"])
-            if ok:
-                st.success(msg)
-            else:
-                st.warning(msg)
-
-        st.markdown("---")
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Gesamtwert Depot", f"{total_val:,.2f} €")
-        k2.metric("Jährliche Brutto-Dividende", f"{total_div:,.2f} €")
-        k3.metric("Gewichtete Dividendenrendite", f"{weighted_yield:.2f} %")
-        k4.metric("Ø Analysten-Potenzial (12M)", f"{weighted_upside:+.1f} %")
-        
-        df_sorted = edited_df.sort_values(by="Positionswert (€)", ascending=False)
-        c_chart1, c_chart2 = st.columns(2)
-        with c_chart1:
-            fig_pie = px.pie(df_sorted, values="Positionswert (€)", names="Cluster", hole=0.4, title="Depot-Allokation nach Sektor-Clustern")
-            st.plotly_chart(fig_pie, use_container_width=True)
-        with c_chart2:
-            fig_bar = px.bar(df_sorted.head(15), x="Positionswert (€)", y="Unternehmen", color="Cluster", orientation="h", title="Top-15 Positionen nach Wert (€)")
-            fig_bar.update_layout(yaxis={'categoryorder':'total ascending'})
-            st.plotly_chart(fig_bar, use_container_width=True)
-            
-        st.markdown("#### 📋 Vollständige Bestands- und Potenzialtabelle (inkl. Positionswert & Gewichtung)")
-        st.dataframe(df_sorted, use_container_width=True, hide_index=True)
+                    if "🟡" in val:
