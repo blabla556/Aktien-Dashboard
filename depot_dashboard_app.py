@@ -967,7 +967,7 @@ with tab_compare:
                         "Div.-Rendite": f"{d_yield:.2f} %",
                         "1. KGV (P/E)": f"{pe:.1f}" if pe else "N/A",
                         "2. Kurs-Cashflow (P/OCF)": f"{p_cf:.1f}" if p_cf else (f"ROE: {roe:.1f}%" if roe else "N/A"),
-                        "3. Dynamik (Div. / Ums.-Gew.)": growth_ str,
+                        "3. Dynamik (Div. / Ums.-Gew.)": groth_str,
                         "4. Net Debt / EBITDA": "Netto-Cash (<0x)" if (not is_fin and net_debt <= 0) else (f"{nd_ebitda:.2f}x" if nd_ebitda is not None else (f"ROE: {roe:.1f}%" if is_fin and roe else "N/A")),
                         "5. Analysten-Potenzial (12M)": f"{upside_1y:+.1f} %",
                         "🎯 GESAMT-SCORE (0-10)": total_score,
